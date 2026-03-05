@@ -43,6 +43,9 @@ from renderdoc_mcp.validation import (  # noqa: E402
     validate_float_array,
     cross_validate_pixel,
     validate_pipeline_state,
+    validate_vertex_data,
+    validate_cbuffer_variables,
+    cross_validate_float_arrays,
     build_validation_summary,
 )
 
@@ -251,6 +254,174 @@ class TestValidatePipelineState(unittest.TestCase):
         }
         warnings = validate_pipeline_state(state)
         self.assertTrue(any("null/zero" in w for w in warnings))
+
+
+class TestValidateVertexData(unittest.TestCase):
+    def test_clean_vertices(self):
+        vertices = [
+            [0.5, 0.3, 0.1, 1.0, 0.0, 1.0],
+            [1.0, 0.0, 0.5, 1.0, 0.5, 0.5],
+            [0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+        ]
+        warnings = validate_vertex_data(vertices)
+        self.assertEqual(warnings, [])
+
+    def test_empty_vertices(self):
+        warnings = validate_vertex_data([])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("empty", warnings[0])
+
+    def test_nan_in_vertices(self):
+        vertices = [
+            [float("nan"), 0.3, 0.1, 1.0],
+            [1.0, 0.0, 0.5, 1.0],
+        ]
+        warnings = validate_vertex_data(vertices)
+        self.assertTrue(any("NaN" in w for w in warnings))
+
+    def test_inf_in_vertices(self):
+        vertices = [
+            [float("inf"), 0.3, 0.1, 1.0],
+            [1.0, 0.0, 0.5, 1.0],
+        ]
+        warnings = validate_vertex_data(vertices)
+        self.assertTrue(any("Inf" in w for w in warnings))
+
+    def test_inconsistent_stride(self):
+        vertices = [
+            [1.0, 2.0, 3.0],
+            [1.0, 2.0, 3.0, 4.0],  # different length
+        ]
+        warnings = validate_vertex_data(vertices)
+        self.assertTrue(any("inconsistent" in w for w in warnings))
+
+    def test_degenerate_positions(self):
+        # All vertices at origin — suspicious
+        vertices = [
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        warnings = validate_vertex_data(vertices, position_offset=0)
+        self.assertTrue(any("(0,0,0)" in w for w in warnings))
+
+    def test_abnormal_w_component(self):
+        vertices = [
+            [1.0, 2.0, 3.0, 0.0],  # W=0
+            [4.0, 5.0, 6.0, 0.0],
+            [7.0, 8.0, 9.0, 0.0],
+        ]
+        warnings = validate_vertex_data(vertices, position_offset=0)
+        self.assertTrue(any("W=0" in w for w in warnings))
+
+
+class TestValidateCbufferVariables(unittest.TestCase):
+    def test_clean_variables(self):
+        variables = [
+            {"name": "color", "value": [1.0, 0.5, 0.3, 1.0], "rows": 1, "columns": 4},
+            {"name": "scale", "value": [2.0], "rows": 1, "columns": 1},
+        ]
+        warnings = validate_cbuffer_variables(variables)
+        self.assertEqual(warnings, [])
+
+    def test_empty_variables(self):
+        warnings = validate_cbuffer_variables([])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("no variables", warnings[0])
+
+    def test_nan_in_variable(self):
+        variables = [
+            {"name": "badColor", "value": [float("nan"), 0.5, 0.3, 1.0]},
+        ]
+        warnings = validate_cbuffer_variables(variables)
+        self.assertTrue(any("NaN" in w for w in warnings))
+        self.assertTrue(any("badColor" in w for w in warnings))
+
+    def test_inf_in_variable(self):
+        variables = [
+            {"name": "brightness", "value": [float("inf")]},
+        ]
+        warnings = validate_cbuffer_variables(variables)
+        self.assertTrue(any("Inf" in w for w in warnings))
+
+    def test_extremely_large_value(self):
+        variables = [
+            {"name": "suspiciousVal", "value": [1e35]},
+        ]
+        warnings = validate_cbuffer_variables(variables)
+        self.assertTrue(any("extremely large" in w for w in warnings))
+
+    def test_nested_struct_nan(self):
+        variables = [
+            {
+                "name": "params",
+                "members": [
+                    {"name": "inner", "value": [float("nan"), 1.0]},
+                ],
+            },
+        ]
+        warnings = validate_cbuffer_variables(variables)
+        self.assertTrue(any("NaN" in w for w in warnings))
+        self.assertTrue(any("inner" in w for w in warnings))
+
+    def test_matrix_values(self):
+        # 4x4 matrix as nested list
+        variables = [
+            {
+                "name": "viewProj",
+                "value": [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                "rows": 4,
+                "columns": 4,
+            },
+        ]
+        warnings = validate_cbuffer_variables(variables)
+        self.assertEqual(warnings, [])
+
+
+class TestCrossValidateFloatArrays(unittest.TestCase):
+    def test_identical(self):
+        warnings = cross_validate_float_arrays(
+            [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]
+        )
+        self.assertEqual(warnings, [])
+
+    def test_within_tolerance(self):
+        warnings = cross_validate_float_arrays(
+            [1.0, 2.0], [1.00005, 2.00003], tolerance=1e-4
+        )
+        self.assertEqual(warnings, [])
+
+    def test_mismatch(self):
+        warnings = cross_validate_float_arrays(
+            [1.0, 2.0], [1.0, 9.0], context="test"
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("test", warnings[0])
+        self.assertIn("mismatched", warnings[0])
+
+    def test_length_mismatch(self):
+        warnings = cross_validate_float_arrays([1.0, 2.0], [1.0])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("length mismatch", warnings[0])
+
+    def test_nan_consistency(self):
+        warnings = cross_validate_float_arrays(
+            [float("nan"), 2.0], [float("nan"), 2.0]
+        )
+        self.assertEqual(warnings, [])
+
+    def test_nan_mismatch(self):
+        warnings = cross_validate_float_arrays(
+            [float("nan"), 2.0], [1.0, 2.0]
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("NaN mismatch", warnings[0])
 
 
 class TestBuildValidationSummary(unittest.TestCase):

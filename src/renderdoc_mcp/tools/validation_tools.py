@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import struct
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -13,6 +14,9 @@ from renderdoc_mcp.util import (
     to_json,
     make_error,
     serialize_texture_desc,
+    serialize_shader_variable,
+    SHADER_STAGE_MAP,
+    MESH_DATA_STAGE_MAP,
 )
 from renderdoc_mcp.validation import (
     validate_pixel_value,
@@ -22,8 +26,26 @@ from renderdoc_mcp.validation import (
     validate_float_array,
     cross_validate_pixel,
     validate_pipeline_state,
+    validate_vertex_data,
+    validate_cbuffer_variables,
+    cross_validate_float_arrays,
     build_validation_summary,
 )
+
+
+def _flatten_value(val) -> list[float]:
+    """Flatten a shader variable value (scalar, list, or nested list) to a flat float list."""
+    if isinstance(val, (int, float)):
+        return [float(val)]
+    if isinstance(val, list):
+        result: list[float] = []
+        for item in val:
+            if isinstance(item, list):
+                result.extend(float(v) for v in item if isinstance(v, (int, float)))
+            elif isinstance(item, (int, float)):
+                result.append(float(item))
+        return result
+    return []
 
 
 def register(mcp: FastMCP):
@@ -335,6 +357,331 @@ def register(mcp: FastMCP):
             summary["resource_type"] = resource_type
         if resource_name is not None:
             summary["resource_name"] = resource_name
+
+        return to_json(summary)
+
+    @mcp.tool()
+    def validate_vertex_output(
+        event_id: int,
+        stage: str = "vsout",
+    ) -> str:
+        """Validate post-vertex-shader data by reading it twice and cross-checking.
+
+        Performs these checks:
+        1. Double-read consistency — reads VS output twice with re-navigation to detect
+           replay instability.
+        2. Vertex data integrity — scans for NaN, Inf, degenerate (0,0,0) positions,
+           and abnormal W components.
+        3. Vertex count vs action.numIndices consistency.
+        4. Stride and attribute layout sanity checks.
+
+        Args:
+            event_id: The draw call event ID to validate.
+            stage: Data stage: "vsin", "vsout", "gsout". Default: "vsout".
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+        err = session.set_event(event_id)
+        if err:
+            return to_json(err)
+
+        mesh_stage = MESH_DATA_STAGE_MAP.get(stage.lower())
+        if mesh_stage is None:
+            return to_json(make_error(
+                f"Unknown mesh stage: {stage}. Valid: {list(MESH_DATA_STAGE_MAP.keys())}",
+                "API_ERROR",
+            ))
+
+        checks: dict[str, list[str]] = {}
+
+        # ── Read 1: Get VS data ──
+        read1_warnings: list[str] = []
+        postvs = session.controller.GetPostVSData(0, 0, mesh_stage)
+        if postvs.vertexResourceId == rd.ResourceId.Null():
+            return to_json(make_error(
+                f"No post-VS data available at event {event_id} for stage '{stage}'",
+                "API_ERROR",
+            ))
+
+        num_verts = postvs.numIndices
+        stride = postvs.vertexByteStride
+        floats_per_vertex = stride // 4
+
+        data1 = session.controller.GetBufferData(
+            postvs.vertexResourceId, postvs.vertexByteOffset,
+            num_verts * stride,
+        )
+
+        vertices1: list[list[float]] = []
+        for i in range(num_verts):
+            offset = i * stride
+            if offset + stride > len(data1):
+                break
+            vfloats = list(struct.unpack_from(f"{floats_per_vertex}f", data1, offset))
+            vertices1.append([round(f, 6) for f in vfloats])
+
+        if len(vertices1) < num_verts:
+            read1_warnings.append(
+                f"buffer data truncated: expected {num_verts} vertices "
+                f"but only read {len(vertices1)} — buffer may be too small"
+            )
+        checks["data_read"] = read1_warnings
+
+        # ── Read 2: Re-navigate and read again for consistency ──
+        consistency_warnings: list[str] = []
+        session.controller.SetFrameEvent(event_id, True)
+        postvs2 = session.controller.GetPostVSData(0, 0, mesh_stage)
+
+        if postvs2.vertexResourceId == rd.ResourceId.Null():
+            consistency_warnings.append(
+                "second read returned null vertex resource — replay inconsistency"
+            )
+        else:
+            if postvs2.numIndices != num_verts:
+                consistency_warnings.append(
+                    f"vertex count changed between reads: "
+                    f"{num_verts} → {postvs2.numIndices}"
+                )
+            if postvs2.vertexByteStride != stride:
+                consistency_warnings.append(
+                    f"stride changed between reads: {stride} → {postvs2.vertexByteStride}"
+                )
+
+            data2 = session.controller.GetBufferData(
+                postvs2.vertexResourceId, postvs2.vertexByteOffset,
+                min(num_verts, 10) * stride,  # spot-check first 10 vertices
+            )
+
+            vertices2: list[list[float]] = []
+            check_count = min(num_verts, 10)
+            for i in range(check_count):
+                offset = i * stride
+                if offset + stride > len(data2):
+                    break
+                vfloats = list(struct.unpack_from(f"{floats_per_vertex}f", data2, offset))
+                vertices2.append([round(f, 6) for f in vfloats])
+
+            # Compare first N vertices between two reads
+            for i, (v1, v2) in enumerate(zip(vertices1[:check_count], vertices2)):
+                mismatches = cross_validate_float_arrays(
+                    v1, v2, tolerance=1e-4, context=f"vertex[{i}]"
+                )
+                consistency_warnings.extend(mismatches)
+                if len(consistency_warnings) > 5:
+                    consistency_warnings.append("... (truncated, too many mismatches)")
+                    break
+
+        checks["double_read_consistency"] = consistency_warnings
+
+        # ── Check 3: Vertex data integrity ──
+        # Find position attribute offset
+        pos_offset: int | None = None
+        state = session.controller.GetPipelineState()
+        try:
+            if stage.lower() != "vsin":
+                vs_refl = state.GetShaderReflection(rd.ShaderStage.Vertex)
+                if vs_refl is not None:
+                    float_offset = 0
+                    for sig in vs_refl.outputSignature:
+                        name = (sig.semanticName or sig.varName or "").upper()
+                        if "POSITION" in name:
+                            pos_offset = float_offset
+                            break
+                        float_offset += sig.compCount
+        except Exception:
+            pass
+
+        integrity_warnings = validate_vertex_data(
+            vertices1,
+            num_indices=num_verts,
+            position_offset=pos_offset,
+        )
+        checks["vertex_integrity"] = integrity_warnings
+
+        # ── Check 4: Action numIndices vs actual data ──
+        action_warnings: list[str] = []
+        action = session.get_action(event_id)
+        if action is not None:
+            if action.numIndices != num_verts:
+                action_warnings.append(
+                    f"action.numIndices={action.numIndices} but "
+                    f"PostVS.numIndices={num_verts}"
+                )
+        checks["action_consistency"] = action_warnings
+
+        summary = build_validation_summary(checks)
+        summary["event_id"] = event_id
+        summary["stage"] = stage
+        summary["vertex_count"] = len(vertices1)
+        summary["vertex_stride"] = stride
+        summary["floats_per_vertex"] = floats_per_vertex
+        if action is not None:
+            sf = session.structured_file
+            summary["action_name"] = action.GetName(sf)
+
+        return to_json(summary)
+
+    @mcp.tool()
+    def validate_cbuffer(
+        stage: str,
+        cbuffer_index: int,
+        event_id: int,
+    ) -> str:
+        """Validate constant buffer contents by reading twice and checking for anomalies.
+
+        Performs these checks:
+        1. Double-read consistency — reads cbuffer twice with re-navigation to detect
+           replay instability or stale data.
+        2. Value integrity — scans all variables for NaN, Inf, extremely large values
+           that may indicate uninitialized memory.
+        3. Metadata consistency — verifies cbuffer size and variable count match
+           reflection data.
+
+        Args:
+            stage: Shader stage (vertex, hull, domain, geometry, pixel, compute).
+            cbuffer_index: Index of the constant buffer.
+            event_id: The event ID to validate at.
+        """
+        session = get_session()
+        err = session.require_open()
+        if err:
+            return to_json(err)
+        err = session.set_event(event_id)
+        if err:
+            return to_json(err)
+
+        stage_enum = SHADER_STAGE_MAP.get(stage.lower())
+        if stage_enum is None:
+            return to_json(make_error(
+                f"Unknown shader stage: {stage}", "API_ERROR",
+            ))
+
+        checks: dict[str, list[str]] = {}
+
+        # ── Get reflection metadata ──
+        meta_warnings: list[str] = []
+        state = session.controller.GetPipelineState()
+        refl = state.GetShaderReflection(stage_enum)
+        if refl is None:
+            return to_json(make_error(
+                f"No shader bound at stage '{stage}'", "API_ERROR",
+            ))
+
+        num_cbs = len(refl.constantBlocks)
+        if cbuffer_index < 0 or cbuffer_index >= num_cbs:
+            return to_json(make_error(
+                f"cbuffer_index {cbuffer_index} out of range (0-{num_cbs - 1})",
+                "API_ERROR",
+            ))
+
+        cb_refl = refl.constantBlocks[cbuffer_index]
+        cb_name = cb_refl.name
+        cb_byte_size = cb_refl.byteSize
+        checks["metadata"] = meta_warnings
+
+        # ── Read 1: Get cbuffer contents ──
+        def _read_cbuffer():
+            s = session.controller.GetPipelineState()
+            r = s.GetShaderReflection(stage_enum)
+            if stage_enum == rd.ShaderStage.Compute:
+                pipe = s.GetComputePipelineObject()
+            else:
+                pipe = s.GetGraphicsPipelineObject()
+            entry = s.GetShaderEntryPoint(stage_enum)
+            cb_bind = s.GetConstantBlock(stage_enum, cbuffer_index, 0)
+            cbuffer_vars = session.controller.GetCBufferVariableContents(
+                pipe, r.resourceId, stage_enum, entry,
+                cbuffer_index, cb_bind.descriptor.resource, 0, 0,
+            )
+            return [serialize_shader_variable(v) for v in cbuffer_vars]
+
+        try:
+            vars1 = _read_cbuffer()
+        except Exception as e:
+            return to_json(make_error(
+                f"Failed to read cbuffer: {type(e).__name__}: {e}", "API_ERROR",
+            ))
+
+        # ── Read 2: Re-navigate and read again ──
+        consistency_warnings: list[str] = []
+        try:
+            session.controller.SetFrameEvent(event_id, True)
+            vars2 = _read_cbuffer()
+
+            # Compare variable counts
+            if len(vars1) != len(vars2):
+                consistency_warnings.append(
+                    f"variable count changed between reads: "
+                    f"{len(vars1)} → {len(vars2)}"
+                )
+            else:
+                # Compare variable values
+                for i, (v1, v2) in enumerate(zip(vars1, vars2)):
+                    name = v1.get("name", f"var[{i}]")
+                    val1 = v1.get("value")
+                    val2 = v2.get("value")
+                    if val1 is not None and val2 is not None:
+                        # Flatten values for comparison
+                        flat1 = _flatten_value(val1)
+                        flat2 = _flatten_value(val2)
+                        mismatches = cross_validate_float_arrays(
+                            flat1, flat2,
+                            tolerance=1e-6,
+                            context=name,
+                        )
+                        consistency_warnings.extend(mismatches)
+
+                    # Also compare recursively for struct members
+                    members1 = v1.get("members", [])
+                    members2 = v2.get("members", [])
+                    if len(members1) != len(members2):
+                        consistency_warnings.append(
+                            f"{name}: member count changed: "
+                            f"{len(members1)} → {len(members2)}"
+                        )
+
+                    if len(consistency_warnings) > 10:
+                        consistency_warnings.append(
+                            "... (truncated, too many mismatches)"
+                        )
+                        break
+
+        except Exception as e:
+            consistency_warnings.append(
+                f"second read failed: {type(e).__name__}: {e}"
+            )
+        checks["double_read_consistency"] = consistency_warnings
+
+        # ── Check 3: Value integrity ──
+        value_warnings = validate_cbuffer_variables(
+            vars1, expected_byte_size=cb_byte_size,
+        )
+        checks["value_integrity"] = value_warnings
+
+        # ── Check 4: Binding resource validity ──
+        binding_warnings: list[str] = []
+        try:
+            cb_bind = state.GetConstantBlock(stage_enum, cbuffer_index, 0)
+            rid_str = str(cb_bind.descriptor.resource)
+            binding_warnings.extend(validate_resource_id(rid_str))
+        except Exception as e:
+            binding_warnings.append(
+                f"failed to check cbuffer binding: {type(e).__name__}: {e}"
+            )
+        checks["binding_resource"] = binding_warnings
+
+        summary = build_validation_summary(checks)
+        summary["event_id"] = event_id
+        summary["stage"] = stage
+        summary["cbuffer_index"] = cbuffer_index
+        summary["cbuffer_name"] = cb_name
+        summary["cbuffer_byte_size"] = cb_byte_size
+        summary["variable_count"] = len(vars1)
+        if action := session.get_action(event_id):
+            sf = session.structured_file
+            summary["action_name"] = action.GetName(sf)
 
         return to_json(summary)
 

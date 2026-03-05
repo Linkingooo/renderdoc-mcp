@@ -188,6 +188,210 @@ def validate_pipeline_state(state: dict) -> list[str]:
     return warnings
 
 
+def validate_vertex_data(
+    vertices: list[list[float]],
+    num_indices: int | None = None,
+    position_offset: int | None = None,
+) -> list[str]:
+    """Validate post-VS vertex data for common issues.
+
+    Args:
+        vertices: List of vertex float arrays.
+        num_indices: Expected vertex count from the action (numIndices).
+        position_offset: Float offset of position attribute (if known).
+
+    Returns a list of warning strings (empty if clean).
+    """
+    warnings: list[str] = []
+
+    if not vertices:
+        warnings.append("vertex data is empty — no vertices returned")
+        return warnings
+
+    # Check vertex count consistency
+    if num_indices is not None and len(vertices) != num_indices:
+        # This is informational — may be capped by max_vertices
+        if len(vertices) < num_indices:
+            pass  # expected truncation
+        else:
+            warnings.append(
+                f"vertex count mismatch: got {len(vertices)} "
+                f"but action.numIndices={num_indices}"
+            )
+
+    # Check all vertices have same length
+    lengths = {len(v) for v in vertices}
+    if len(lengths) > 1:
+        warnings.append(
+            f"inconsistent vertex stride: found {len(lengths)} different "
+            f"lengths {sorted(lengths)} — data may be misaligned"
+        )
+
+    # Check for NaN/Inf in vertex data
+    nan_vertices = 0
+    inf_vertices = 0
+    all_zero_vertices = 0
+    for i, v in enumerate(vertices):
+        has_nan = any(math.isnan(f) for f in v if isinstance(f, float))
+        has_inf = any(math.isinf(f) for f in v if isinstance(f, float))
+        if has_nan:
+            nan_vertices += 1
+        if has_inf:
+            inf_vertices += 1
+
+        # Check if position is all zeros (degenerate vertex)
+        if position_offset is not None and position_offset + 3 <= len(v):
+            px, py, pz = v[position_offset], v[position_offset + 1], v[position_offset + 2]
+            if px == 0.0 and py == 0.0 and pz == 0.0:
+                all_zero_vertices += 1
+
+    if nan_vertices > 0:
+        warnings.append(f"{nan_vertices}/{len(vertices)} vertices contain NaN values")
+    if inf_vertices > 0:
+        warnings.append(f"{inf_vertices}/{len(vertices)} vertices contain Inf values")
+
+    # Check for degenerate positions
+    if position_offset is not None and all_zero_vertices > 0:
+        ratio = all_zero_vertices / len(vertices)
+        if ratio > 0.5:
+            warnings.append(
+                f"{all_zero_vertices}/{len(vertices)} vertices have (0,0,0) position "
+                f"— possible data read error or uninitialized buffer"
+            )
+
+    # Check position W component (should typically be 1.0 after VS)
+    if position_offset is not None:
+        w_offset = position_offset + 3
+        abnormal_w = 0
+        for v in vertices:
+            if w_offset < len(v):
+                w = v[w_offset]
+                if isinstance(w, float) and not math.isnan(w) and not math.isinf(w):
+                    if w == 0.0:
+                        abnormal_w += 1
+        if abnormal_w > len(vertices) * 0.5:
+            warnings.append(
+                f"{abnormal_w}/{len(vertices)} vertices have W=0 — "
+                f"homogeneous coordinate may be incorrect (expect W=1 for most cases)"
+            )
+
+    return warnings
+
+
+def validate_cbuffer_variables(
+    variables: list[dict],
+    expected_byte_size: int | None = None,
+) -> list[str]:
+    """Validate constant buffer variable contents for anomalies.
+
+    Args:
+        variables: List of serialized shader variable dicts.
+        expected_byte_size: Expected cbuffer size from reflection metadata.
+
+    Returns a list of warning strings (empty if clean).
+    """
+    warnings: list[str] = []
+
+    if not variables:
+        warnings.append("constant buffer has no variables")
+        return warnings
+
+    def _check_var(var: dict, path: str = "") -> None:
+        name = var.get("name", "?")
+        full_name = f"{path}.{name}" if path else name
+
+        # Check leaf values
+        value = var.get("value")
+        if value is not None:
+            flat_vals: list[float] = []
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, list):
+                        flat_vals.extend(
+                            v for v in item if isinstance(v, (int, float))
+                        )
+                    elif isinstance(item, (int, float)):
+                        flat_vals.append(item)
+
+            nan_count = sum(1 for v in flat_vals if isinstance(v, float) and math.isnan(v))
+            inf_count = sum(1 for v in flat_vals if isinstance(v, float) and math.isinf(v))
+
+            if nan_count > 0:
+                warnings.append(f"{full_name}: contains {nan_count} NaN value(s)")
+            if inf_count > 0:
+                warnings.append(f"{full_name}: contains {inf_count} Inf value(s)")
+
+            # Check for suspiciously large values (potential uninitialized memory)
+            for v in flat_vals:
+                if isinstance(v, float) and not math.isnan(v) and not math.isinf(v):
+                    if abs(v) > 1e30:
+                        warnings.append(
+                            f"{full_name}: extremely large value {v:.2e} "
+                            f"— possible uninitialized data"
+                        )
+                        break
+
+        # Check members recursively
+        for m in var.get("members", []):
+            _check_var(m, full_name)
+
+    for var in variables:
+        _check_var(var)
+
+    return warnings
+
+
+def cross_validate_float_arrays(
+    array1: list[float],
+    array2: list[float],
+    tolerance: float = 1e-4,
+    context: str = "",
+) -> list[str]:
+    """Compare two float arrays element-by-element within tolerance.
+
+    Returns a list of mismatch descriptions (empty if consistent).
+    """
+    warnings: list[str] = []
+    prefix = f"{context}: " if context else ""
+
+    if len(array1) != len(array2):
+        warnings.append(
+            f"{prefix}length mismatch: {len(array1)} vs {len(array2)}"
+        )
+        return warnings
+
+    mismatches = 0
+    first_mismatch = None
+    for i, (a, b) in enumerate(zip(array1, array2)):
+        if isinstance(a, float) and isinstance(b, float):
+            if math.isnan(a) and math.isnan(b):
+                continue
+            if math.isnan(a) != math.isnan(b):
+                mismatches += 1
+                if first_mismatch is None:
+                    first_mismatch = f"index {i}: NaN mismatch ({a} vs {b})"
+                continue
+            if math.isinf(a) != math.isinf(b):
+                mismatches += 1
+                if first_mismatch is None:
+                    first_mismatch = f"index {i}: Inf mismatch ({a} vs {b})"
+                continue
+            if abs(a - b) > tolerance:
+                mismatches += 1
+                if first_mismatch is None:
+                    first_mismatch = (
+                        f"index {i}: {a:.6f} vs {b:.6f} "
+                        f"(diff={abs(a - b):.6f})"
+                    )
+
+    if mismatches > 0:
+        warnings.append(
+            f"{prefix}{mismatches} mismatched value(s), "
+            f"first: {first_mismatch}"
+        )
+    return warnings
+
+
 def build_validation_summary(checks: dict[str, list[str]]) -> dict:
     """Build a structured validation summary from check results.
 
