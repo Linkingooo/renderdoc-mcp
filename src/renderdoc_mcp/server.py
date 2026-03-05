@@ -17,6 +17,7 @@ from renderdoc_mcp.tools import (
     advanced_tools,
     performance_tools,
     diagnostic_tools,
+    validation_tools,
 )
 
 mcp = FastMCP(
@@ -35,6 +36,7 @@ shader_tools.register(mcp)
 advanced_tools.register(mcp)
 performance_tools.register(mcp)
 diagnostic_tools.register(mcp)
+validation_tools.register(mcp)
 
 
 # ── Prompts ──
