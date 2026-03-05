@@ -1,6 +1,7 @@
 """Unit tests for renderdoc_mcp.validation — data integrity checking helpers."""
 
 import math
+import struct
 import sys
 import unittest
 from unittest.mock import MagicMock
@@ -458,6 +459,119 @@ class TestBuildValidationSummary(unittest.TestCase):
         self.assertEqual(summary["status"], "WARN")
         self.assertEqual(summary["failed"], 2)
         self.assertEqual(summary["total_checks"], 2)
+
+
+class TestHalfToFloat(unittest.TestCase):
+    """Test the half-precision float parser used in raw texture cross-validation."""
+
+    def test_zero(self):
+        from renderdoc_mcp.tools.validation_tools import _half_to_float
+        self.assertEqual(_half_to_float(0x0000), 0.0)
+
+    def test_one(self):
+        from renderdoc_mcp.tools.validation_tools import _half_to_float
+        self.assertAlmostEqual(_half_to_float(0x3C00), 1.0, places=5)
+
+    def test_negative_one(self):
+        from renderdoc_mcp.tools.validation_tools import _half_to_float
+        self.assertAlmostEqual(_half_to_float(0xBC00), -1.0, places=5)
+
+    def test_inf(self):
+        from renderdoc_mcp.tools.validation_tools import _half_to_float
+        self.assertEqual(_half_to_float(0x7C00), float("inf"))
+
+    def test_neg_inf(self):
+        from renderdoc_mcp.tools.validation_tools import _half_to_float
+        self.assertEqual(_half_to_float(0xFC00), float("-inf"))
+
+    def test_nan(self):
+        from renderdoc_mcp.tools.validation_tools import _half_to_float
+        self.assertTrue(math.isnan(_half_to_float(0x7C01)))
+
+    def test_half(self):
+        from renderdoc_mcp.tools.validation_tools import _half_to_float
+        self.assertAlmostEqual(_half_to_float(0x3800), 0.5, places=5)
+
+
+class TestParsePixelFromRaw(unittest.TestCase):
+    """Test raw texture pixel parsing for cross-validation."""
+
+    def test_r32g32b32a32_float(self):
+        from renderdoc_mcp.tools.validation_tools import _parse_pixel_from_raw
+        # 2x1 texture, pixel at (1, 0)
+        pixel0 = struct.pack("<ffff", 0.1, 0.2, 0.3, 1.0)
+        pixel1 = struct.pack("<ffff", 0.5, 0.6, 0.7, 0.8)
+        raw = pixel0 + pixel1
+        result = _parse_pixel_from_raw(raw, 1, 0, 2, "R32G32B32A32_FLOAT")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["r"], 0.5, places=5)
+        self.assertAlmostEqual(result["g"], 0.6, places=5)
+        self.assertAlmostEqual(result["b"], 0.7, places=5)
+        self.assertAlmostEqual(result["a"], 0.8, places=5)
+
+    def test_r8g8b8a8_unorm(self):
+        from renderdoc_mcp.tools.validation_tools import _parse_pixel_from_raw
+        # 1x1 texture: RGBA = (255, 128, 0, 255)
+        raw = struct.pack("<BBBB", 255, 128, 0, 255)
+        result = _parse_pixel_from_raw(raw, 0, 0, 1, "R8G8B8A8_UNORM")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["r"], 1.0, places=2)
+        self.assertAlmostEqual(result["g"], 128 / 255.0, places=2)
+        self.assertAlmostEqual(result["b"], 0.0, places=2)
+        self.assertAlmostEqual(result["a"], 1.0, places=2)
+
+    def test_b8g8r8a8_unorm(self):
+        from renderdoc_mcp.tools.validation_tools import _parse_pixel_from_raw
+        # BGRA order: B=0, G=128, R=255, A=255
+        raw = struct.pack("<BBBB", 0, 128, 255, 255)
+        result = _parse_pixel_from_raw(raw, 0, 0, 1, "B8G8R8A8_UNORM")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["r"], 1.0, places=2)
+        self.assertAlmostEqual(result["g"], 128 / 255.0, places=2)
+        self.assertAlmostEqual(result["b"], 0.0, places=2)
+
+    def test_unsupported_format(self):
+        from renderdoc_mcp.tools.validation_tools import _parse_pixel_from_raw
+        result = _parse_pixel_from_raw(b"\x00" * 16, 0, 0, 1, "BC7_UNORM")
+        self.assertIsNone(result)
+
+
+class TestExtractLeafFloats(unittest.TestCase):
+    """Test structured variable -> flat float extraction for cbuffer cross-validation."""
+
+    def test_simple_variables(self):
+        from renderdoc_mcp.tools.validation_tools import _extract_leaf_floats
+        variables = [
+            {"name": "color", "value": [1.0, 0.5, 0.3, 1.0]},
+            {"name": "scale", "value": [2.0]},
+        ]
+        result = _extract_leaf_floats(variables)
+        self.assertEqual(result, [1.0, 0.5, 0.3, 1.0, 2.0])
+
+    def test_nested_struct(self):
+        from renderdoc_mcp.tools.validation_tools import _extract_leaf_floats
+        variables = [
+            {
+                "name": "params",
+                "members": [
+                    {"name": "x", "value": [1.0]},
+                    {"name": "y", "value": [2.0]},
+                ],
+            },
+        ]
+        result = _extract_leaf_floats(variables)
+        self.assertEqual(result, [1.0, 2.0])
+
+    def test_matrix(self):
+        from renderdoc_mcp.tools.validation_tools import _extract_leaf_floats
+        variables = [
+            {
+                "name": "mat",
+                "value": [[1.0, 0.0], [0.0, 1.0]],
+            },
+        ]
+        result = _extract_leaf_floats(variables)
+        self.assertEqual(result, [1.0, 0.0, 0.0, 1.0])
 
 
 if __name__ == "__main__":

@@ -33,6 +33,29 @@ from renderdoc_mcp.validation import (
 )
 
 
+def _extract_leaf_floats(variables: list[dict]) -> list[float]:
+    """Extract all leaf float values from serialized shader variables in declaration order.
+
+    This produces a flat list matching the cbuffer memory layout, suitable for
+    comparison against raw buffer bytes interpreted as float32[].
+    """
+    result: list[float] = []
+
+    def _walk(var: dict) -> None:
+        members = var.get("members", [])
+        if members:
+            for m in members:
+                _walk(m)
+        else:
+            value = var.get("value")
+            if value is not None:
+                result.extend(_flatten_value(value))
+
+    for v in variables:
+        _walk(v)
+    return result
+
+
 def _flatten_value(val) -> list[float]:
     """Flatten a shader variable value (scalar, list, or nested list) to a flat float list."""
     if isinstance(val, (int, float)):
@@ -46,6 +69,138 @@ def _flatten_value(val) -> list[float]:
                 result.append(float(item))
         return result
     return []
+
+
+# ── Raw texture format pixel parsers ──
+# Maps format name patterns to (bytes_per_pixel, unpack_func)
+# unpack_func: (raw_bytes) -> {"r", "g", "b", "a"}
+
+def _parse_pixel_from_raw(
+    raw_data: bytes,
+    x: int,
+    y: int,
+    width: int,
+    fmt_name: str,
+) -> dict | None:
+    """Extract a single pixel from raw texture data based on format.
+
+    Returns {"r", "g", "b", "a"} dict or None if format is unsupported.
+    """
+    # R32G32B32A32_FLOAT — 16 bytes per pixel
+    if "R32G32B32A32" in fmt_name and "FLOAT" in fmt_name:
+        bpp = 16
+        offset = (y * width + x) * bpp
+        if offset + bpp > len(raw_data):
+            return None
+        r, g, b, a = struct.unpack_from("<ffff", raw_data, offset)
+        return {"r": r, "g": g, "b": b, "a": a}
+
+    # R32G32B32_FLOAT — 12 bytes per pixel
+    if "R32G32B32" in fmt_name and "FLOAT" in fmt_name and "A" not in fmt_name:
+        bpp = 12
+        offset = (y * width + x) * bpp
+        if offset + bpp > len(raw_data):
+            return None
+        r, g, b = struct.unpack_from("<fff", raw_data, offset)
+        return {"r": r, "g": g, "b": b, "a": 1.0}
+
+    # R16G16B16A16_FLOAT — 8 bytes per pixel (half floats)
+    if "R16G16B16A16" in fmt_name and "FLOAT" in fmt_name:
+        bpp = 8
+        offset = (y * width + x) * bpp
+        if offset + bpp > len(raw_data):
+            return None
+        halves = struct.unpack_from("<HHHH", raw_data, offset)
+        r, g, b, a = [_half_to_float(h) for h in halves]
+        return {"r": r, "g": g, "b": b, "a": a}
+
+    # R8G8B8A8_UNORM / B8G8R8A8_UNORM — 4 bytes per pixel
+    if ("R8G8B8A8" in fmt_name or "B8G8R8A8" in fmt_name) and "UNORM" in fmt_name:
+        bpp = 4
+        offset = (y * width + x) * bpp
+        if offset + bpp > len(raw_data):
+            return None
+        b0, b1, b2, b3 = struct.unpack_from("<BBBB", raw_data, offset)
+        if "B8G8R8A8" in fmt_name:
+            return {"r": b2 / 255.0, "g": b1 / 255.0, "b": b0 / 255.0, "a": b3 / 255.0}
+        else:
+            return {"r": b0 / 255.0, "g": b1 / 255.0, "b": b2 / 255.0, "a": b3 / 255.0}
+
+    # R11G11B10_FLOAT — 4 bytes per pixel (packed)
+    if "R11G11B10" in fmt_name and "FLOAT" in fmt_name:
+        bpp = 4
+        offset = (y * width + x) * bpp
+        if offset + bpp > len(raw_data):
+            return None
+        packed = struct.unpack_from("<I", raw_data, offset)[0]
+        r = _unpack_r11(packed & 0x7FF)
+        g = _unpack_r11((packed >> 11) & 0x7FF)
+        b = _unpack_r10((packed >> 22) & 0x3FF)
+        return {"r": r, "g": g, "b": b, "a": 1.0}
+
+    # R32_FLOAT — 4 bytes, single channel
+    if "R32" in fmt_name and "FLOAT" in fmt_name and "G" not in fmt_name:
+        bpp = 4
+        offset = (y * width + x) * bpp
+        if offset + bpp > len(raw_data):
+            return None
+        r = struct.unpack_from("<f", raw_data, offset)[0]
+        return {"r": r, "g": 0.0, "b": 0.0, "a": 1.0}
+
+    # R16G16_FLOAT — 4 bytes
+    if "R16G16" in fmt_name and "FLOAT" in fmt_name and "B" not in fmt_name:
+        bpp = 4
+        offset = (y * width + x) * bpp
+        if offset + bpp > len(raw_data):
+            return None
+        halves = struct.unpack_from("<HH", raw_data, offset)
+        r, g = [_half_to_float(h) for h in halves]
+        return {"r": r, "g": g, "b": 0.0, "a": 1.0}
+
+    return None  # unsupported format
+
+
+def _half_to_float(h: int) -> float:
+    """Convert IEEE 754 half-precision (16-bit) to Python float."""
+    sign = (h >> 15) & 1
+    exp = (h >> 10) & 0x1F
+    frac = h & 0x3FF
+
+    if exp == 0:
+        if frac == 0:
+            return -0.0 if sign else 0.0
+        # Denormalized
+        val = (frac / 1024.0) * (2 ** -14)
+        return -val if sign else val
+    elif exp == 31:
+        if frac == 0:
+            return float("-inf") if sign else float("inf")
+        return float("nan")
+
+    val = (1.0 + frac / 1024.0) * (2 ** (exp - 15))
+    return -val if sign else val
+
+
+def _unpack_r11(bits: int) -> float:
+    """Unpack R11 from R11G11B10_FLOAT (5-bit exp, 6-bit mantissa, no sign)."""
+    exp = (bits >> 6) & 0x1F
+    frac = bits & 0x3F
+    if exp == 0:
+        return (frac / 64.0) * (2 ** -14) if frac else 0.0
+    if exp == 31:
+        return float("inf") if frac == 0 else float("nan")
+    return (1.0 + frac / 64.0) * (2 ** (exp - 15))
+
+
+def _unpack_r10(bits: int) -> float:
+    """Unpack B10 from R11G11B10_FLOAT (5-bit exp, 5-bit mantissa, no sign)."""
+    exp = (bits >> 5) & 0x1F
+    frac = bits & 0x1F
+    if exp == 0:
+        return (frac / 32.0) * (2 ** -14) if frac else 0.0
+    if exp == 31:
+        return float("inf") if frac == 0 else float("nan")
+    return (1.0 + frac / 32.0) * (2 ** (exp - 15))
 
 
 def register(mcp: FastMCP):
@@ -202,10 +357,14 @@ def register(mcp: FastMCP):
         y: int,
         event_id: Optional[int] = None,
     ) -> str:
-        """Cross-validate a pixel value by reading it two different ways.
+        """Cross-validate a pixel value using two independent RenderDoc API paths.
 
-        Reads the pixel using both PickPixel and GetMinMax (for 1x1 region),
-        then compares results. Discrepancies indicate potential data issues.
+        Method A: PickPixel — GPU-side pixel sampling at (x, y).
+        Method B: GetTextureData — reads the raw texture bytes, then manually
+                  extracts the pixel value at (x, y) from the byte array.
+
+        If both methods return the same value, the data is reliable.
+        Discrepancies indicate a replay issue, driver bug, or data corruption.
 
         Args:
             resource_id: The texture resource ID string.
@@ -228,39 +387,73 @@ def register(mcp: FastMCP):
                 "INVALID_RESOURCE_ID",
             ))
 
-        # Method 1: PickPixel
-        val1 = session.controller.PickPixel(
+        tex_desc = session.get_texture_desc(resource_id)
+        if tex_desc is None:
+            return to_json(make_error(
+                f"No texture description for '{resource_id}'",
+                "API_ERROR",
+            ))
+
+        # ── Method A: PickPixel (GPU-side) ──
+        val_pick = session.controller.PickPixel(
             tex_id, x, y,
             rd.Subresource(0, 0, 0), rd.CompType.Typeless,
         )
         pick_rgba = {
-            "r": val1.floatValue[0], "g": val1.floatValue[1],
-            "b": val1.floatValue[2], "a": val1.floatValue[3],
+            "r": val_pick.floatValue[0], "g": val_pick.floatValue[1],
+            "b": val_pick.floatValue[2], "a": val_pick.floatValue[3],
         }
 
-        # Method 2: PickPixel again (re-navigation check)
-        # Re-navigate to the same event to confirm consistency
-        current_eid = session.current_event
-        if current_eid is not None:
-            session.controller.SetFrameEvent(current_eid, True)
-        val2 = session.controller.PickPixel(
-            tex_id, x, y,
-            rd.Subresource(0, 0, 0), rd.CompType.Typeless,
-        )
-        repick_rgba = {
-            "r": val2.floatValue[0], "g": val2.floatValue[1],
-            "b": val2.floatValue[2], "a": val2.floatValue[3],
-        }
+        # ── Method B: GetTextureData (raw byte read) ──
+        raw_rgba: dict | None = None
+        raw_method_note: str | None = None
+        try:
+            raw_data = session.controller.GetTextureData(
+                tex_id, rd.Subresource(0, 0, 0),
+            )
+            fmt_name = str(tex_desc.format.Name()).upper()
+            width = tex_desc.width
 
-        # Compare the two reads
+            # Parse the pixel from raw bytes based on format
+            raw_rgba = _parse_pixel_from_raw(
+                raw_data, x, y, width, fmt_name,
+            )
+            if raw_rgba is None:
+                raw_method_note = (
+                    f"format {fmt_name} not supported for raw parse — "
+                    f"skipping raw cross-check"
+                )
+        except Exception as e:
+            raw_method_note = (
+                f"GetTextureData failed: {type(e).__name__}: {e} — "
+                f"falling back to double-PickPixel"
+            )
+
+        # ── Fallback: if raw parse failed, do a re-navigation PickPixel ──
+        if raw_rgba is None:
+            current_eid = session.current_event
+            if current_eid is not None:
+                session.controller.SetFrameEvent(current_eid, True)
+            val2 = session.controller.PickPixel(
+                tex_id, x, y,
+                rd.Subresource(0, 0, 0), rd.CompType.Typeless,
+            )
+            raw_rgba = {
+                "r": val2.floatValue[0], "g": val2.floatValue[1],
+                "b": val2.floatValue[2], "a": val2.floatValue[3],
+            }
+            method_b_name = "PickPixel (re-navigation fallback)"
+        else:
+            method_b_name = "GetTextureData (raw bytes)"
+
+        # ── Compare ──
         from renderdoc_mcp.validation import cross_validate_pixel as _cross_val
         mismatches = _cross_val(
             pick_rgba,
-            [repick_rgba["r"], repick_rgba["g"], repick_rgba["b"], repick_rgba["a"]],
-            tolerance=1e-6,
+            [raw_rgba["r"], raw_rgba["g"], raw_rgba["b"], raw_rgba["a"]],
+            tolerance=1e-4,
         )
 
-        # Value anomaly checks
         anomalies = validate_pixel_value(pick_rgba)
 
         result: dict = {
@@ -268,17 +461,23 @@ def register(mcp: FastMCP):
             "x": x,
             "y": y,
             "event_id": session.current_event,
+            "format": str(tex_desc.format.Name()),
+            "method_a": "PickPixel",
+            "method_b": method_b_name,
             "pick_rgba": pick_rgba,
-            "repick_rgba": repick_rgba,
+            "raw_rgba": raw_rgba,
             "consistent": len(mismatches) == 0,
             "value_anomalies": anomalies if anomalies else None,
         }
 
+        if raw_method_note:
+            result["raw_method_note"] = raw_method_note
+
         if mismatches:
             result["mismatches"] = mismatches
             result["warning"] = (
-                "Pixel values differ between two consecutive reads at the same event — "
-                "this may indicate a replay inconsistency or GPU driver issue"
+                f"PickPixel and {method_b_name} disagree — "
+                f"data from one path may be incorrect"
             )
 
         return to_json(result)
@@ -529,15 +728,15 @@ def register(mcp: FastMCP):
         cbuffer_index: int,
         event_id: int,
     ) -> str:
-        """Validate constant buffer contents by reading twice and checking for anomalies.
+        """Validate constant buffer contents using two independent API paths.
 
-        Performs these checks:
-        1. Double-read consistency — reads cbuffer twice with re-navigation to detect
-           replay instability or stale data.
-        2. Value integrity — scans all variables for NaN, Inf, extremely large values
-           that may indicate uninitialized memory.
-        3. Metadata consistency — verifies cbuffer size and variable count match
-           reflection data.
+        Method A: GetCBufferVariableContents — RenderDoc's structured parse that
+                  returns typed variable names and values.
+        Method B: GetBufferData on the raw cbuffer resource — reads raw bytes,
+                  then manually interprets as float32 array.
+
+        If the raw floats match the structured values, the data is reliable.
+        Also checks for NaN, Inf, and extremely large values.
 
         Args:
             stage: Shader stage (vertex, hull, domain, geometry, pixel, compute).
@@ -581,86 +780,135 @@ def register(mcp: FastMCP):
         cb_byte_size = cb_refl.byteSize
         checks["metadata"] = meta_warnings
 
-        # ── Read 1: Get cbuffer contents ──
-        def _read_cbuffer():
-            s = session.controller.GetPipelineState()
-            r = s.GetShaderReflection(stage_enum)
+        # ── Method A: GetCBufferVariableContents (structured) ──
+        try:
             if stage_enum == rd.ShaderStage.Compute:
-                pipe = s.GetComputePipelineObject()
+                pipe = state.GetComputePipelineObject()
             else:
-                pipe = s.GetGraphicsPipelineObject()
-            entry = s.GetShaderEntryPoint(stage_enum)
-            cb_bind = s.GetConstantBlock(stage_enum, cbuffer_index, 0)
+                pipe = state.GetGraphicsPipelineObject()
+            entry = state.GetShaderEntryPoint(stage_enum)
+            cb_bind = state.GetConstantBlock(stage_enum, cbuffer_index, 0)
             cbuffer_vars = session.controller.GetCBufferVariableContents(
-                pipe, r.resourceId, stage_enum, entry,
+                pipe, refl.resourceId, stage_enum, entry,
                 cbuffer_index, cb_bind.descriptor.resource, 0, 0,
             )
-            return [serialize_shader_variable(v) for v in cbuffer_vars]
-
-        try:
-            vars1 = _read_cbuffer()
+            vars_structured = [serialize_shader_variable(v) for v in cbuffer_vars]
         except Exception as e:
             return to_json(make_error(
-                f"Failed to read cbuffer: {type(e).__name__}: {e}", "API_ERROR",
+                f"Failed to read cbuffer (structured): {type(e).__name__}: {e}",
+                "API_ERROR",
             ))
 
-        # ── Read 2: Re-navigate and read again ──
-        consistency_warnings: list[str] = []
+        # ── Method B: GetBufferData on raw cbuffer resource ──
+        cross_warnings: list[str] = []
+        raw_floats: list[float] | None = None
         try:
-            session.controller.SetFrameEvent(event_id, True)
-            vars2 = _read_cbuffer()
+            cb_bind = state.GetConstantBlock(stage_enum, cbuffer_index, 0)
+            cb_resource = cb_bind.descriptor.resource
+            rid_str = str(cb_resource)
 
-            # Compare variable counts
-            if len(vars1) != len(vars2):
-                consistency_warnings.append(
-                    f"variable count changed between reads: "
-                    f"{len(vars1)} → {len(vars2)}"
-                )
+            # Read raw bytes of the cbuffer
+            read_size = min(cb_byte_size, 65536) if cb_byte_size > 0 else 1024
+            raw_data = session.controller.GetBufferData(
+                cb_resource, cb_bind.descriptor.byteOffset, read_size,
+            )
+
+            if len(raw_data) >= 4:
+                num_floats = len(raw_data) // 4
+                raw_floats = list(struct.unpack_from(
+                    f"<{num_floats}f", raw_data,
+                ))
+
+                # Extract structured floats in declaration order for comparison
+                structured_floats = _extract_leaf_floats(vars_structured)
+
+                if structured_floats and raw_floats:
+                    # Compare each structured variable's values against raw
+                    # bytes at expected offsets
+                    match_count = 0
+                    mismatch_count = 0
+                    compare_count = min(len(structured_floats), len(raw_floats))
+
+                    for i in range(compare_count):
+                        sf = structured_floats[i]
+                        rf = raw_floats[i]
+                        if isinstance(sf, float) and isinstance(rf, float):
+                            if math.isnan(sf) and math.isnan(rf):
+                                match_count += 1
+                            elif math.isnan(sf) != math.isnan(rf):
+                                mismatch_count += 1
+                            elif math.isinf(sf) and math.isinf(rf) and (
+                                (sf > 0) == (rf > 0)
+                            ):
+                                match_count += 1
+                            elif not math.isinf(sf) and not math.isinf(rf):
+                                if abs(sf - rf) < 1e-4:
+                                    match_count += 1
+                                else:
+                                    mismatch_count += 1
+                            else:
+                                mismatch_count += 1
+
+                    if mismatch_count > 0:
+                        cross_warnings.append(
+                            f"structured vs raw buffer: {mismatch_count} value "
+                            f"mismatch(es) out of {compare_count} compared "
+                            f"— structured data may have interpretation errors"
+                        )
             else:
-                # Compare variable values
-                for i, (v1, v2) in enumerate(zip(vars1, vars2)):
-                    name = v1.get("name", f"var[{i}]")
-                    val1 = v1.get("value")
-                    val2 = v2.get("value")
-                    if val1 is not None and val2 is not None:
-                        # Flatten values for comparison
-                        flat1 = _flatten_value(val1)
-                        flat2 = _flatten_value(val2)
-                        mismatches = cross_validate_float_arrays(
-                            flat1, flat2,
-                            tolerance=1e-6,
-                            context=name,
-                        )
-                        consistency_warnings.extend(mismatches)
-
-                    # Also compare recursively for struct members
-                    members1 = v1.get("members", [])
-                    members2 = v2.get("members", [])
-                    if len(members1) != len(members2):
-                        consistency_warnings.append(
-                            f"{name}: member count changed: "
-                            f"{len(members1)} → {len(members2)}"
-                        )
-
-                    if len(consistency_warnings) > 10:
-                        consistency_warnings.append(
-                            "... (truncated, too many mismatches)"
-                        )
-                        break
+                cross_warnings.append(
+                    f"raw buffer read returned only {len(raw_data)} bytes "
+                    f"(expected >= {cb_byte_size})"
+                )
 
         except Exception as e:
-            consistency_warnings.append(
-                f"second read failed: {type(e).__name__}: {e}"
+            cross_warnings.append(
+                f"raw buffer cross-check failed: {type(e).__name__}: {e} "
+                f"— falling back to double-read"
             )
-        checks["double_read_consistency"] = consistency_warnings
+            # Fallback: double-read via structured API
+            try:
+                session.controller.SetFrameEvent(event_id, True)
+                if stage_enum == rd.ShaderStage.Compute:
+                    pipe2 = session.controller.GetPipelineState().GetComputePipelineObject()
+                else:
+                    pipe2 = session.controller.GetPipelineState().GetGraphicsPipelineObject()
+                s2 = session.controller.GetPipelineState()
+                r2 = s2.GetShaderReflection(stage_enum)
+                entry2 = s2.GetShaderEntryPoint(stage_enum)
+                cb_bind2 = s2.GetConstantBlock(stage_enum, cbuffer_index, 0)
+                cvars2 = session.controller.GetCBufferVariableContents(
+                    pipe2, r2.resourceId, stage_enum, entry2,
+                    cbuffer_index, cb_bind2.descriptor.resource, 0, 0,
+                )
+                vars2 = [serialize_shader_variable(v) for v in cvars2]
 
-        # ── Check 3: Value integrity ──
+                for i, (v1, v2) in enumerate(zip(vars_structured, vars2)):
+                    name = v1.get("name", f"var[{i}]")
+                    flat1 = _flatten_value(v1.get("value"))
+                    flat2 = _flatten_value(v2.get("value"))
+                    if flat1 and flat2:
+                        mismatches = cross_validate_float_arrays(
+                            flat1, flat2, tolerance=1e-6, context=name,
+                        )
+                        cross_warnings.extend(mismatches)
+                    if len(cross_warnings) > 10:
+                        cross_warnings.append("... (truncated)")
+                        break
+            except Exception as e2:
+                cross_warnings.append(
+                    f"double-read fallback also failed: {type(e2).__name__}: {e2}"
+                )
+
+        checks["cross_validation"] = cross_warnings
+
+        # ── Value integrity ──
         value_warnings = validate_cbuffer_variables(
-            vars1, expected_byte_size=cb_byte_size,
+            vars_structured, expected_byte_size=cb_byte_size,
         )
         checks["value_integrity"] = value_warnings
 
-        # ── Check 4: Binding resource validity ──
+        # ── Binding resource validity ──
         binding_warnings: list[str] = []
         try:
             cb_bind = state.GetConstantBlock(stage_enum, cbuffer_index, 0)
@@ -678,7 +926,14 @@ def register(mcp: FastMCP):
         summary["cbuffer_index"] = cbuffer_index
         summary["cbuffer_name"] = cb_name
         summary["cbuffer_byte_size"] = cb_byte_size
-        summary["variable_count"] = len(vars1)
+        summary["variable_count"] = len(vars_structured)
+        summary["method_a"] = "GetCBufferVariableContents (structured)"
+        summary["method_b"] = (
+            "GetBufferData (raw bytes)" if raw_floats is not None
+            else "GetCBufferVariableContents (double-read fallback)"
+        )
+        if raw_floats is not None:
+            summary["raw_float_count"] = len(raw_floats)
         if action := session.get_action(event_id):
             sf = session.structured_file
             summary["action_name"] = action.GetName(sf)
