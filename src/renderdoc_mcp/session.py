@@ -14,6 +14,8 @@ class RenderDocSession:
         self._initialized: bool = False
         self._cap = None  # CaptureFile
         self._controller = None  # ReplayController
+        self._remote = None  # RemoteServer, set when replaying via a remote host
+        self._remote_host: str | None = None
         self._filepath: str | None = None
         self._current_event: int | None = None
         self._action_map: dict[int, object] = {}
@@ -34,6 +36,10 @@ class RenderDocSession:
     @property
     def filepath(self) -> str | None:
         return self._filepath
+
+    @property
+    def remote_host(self) -> str | None:
+        return self._remote_host
 
     @property
     def controller(self):
@@ -63,8 +69,16 @@ class RenderDocSession:
             return make_error("No capture file is open. Use open_capture first.", "NO_CAPTURE_OPEN")
         return None
 
-    def open(self, filepath: str) -> dict:
-        """Open a .rdc capture file. Closes any previously open capture."""
+    def open(self, filepath: str, remote_host: str | None = None) -> dict:
+        """Open a .rdc capture file. Closes any previously open capture.
+
+        If remote_host is given (e.g. "1.2.3.4" or "1.2.3.4:39920" for a
+        RenderDoc remote server reachable via adb port forward on
+        127.0.0.1:39920), the capture is copied to and replayed on that
+        remote host's GPU instead of locally. Use this when the capture
+        requires hardware features the local GPU lacks (e.g. ETC2 texture
+        compression on a capture made on a mobile device).
+        """
         self._ensure_initialized()
 
         if not os.path.isfile(filepath):
@@ -80,17 +94,50 @@ class RenderDocSession:
             cap.Shutdown()
             return make_error(f"Failed to open file: {result}", "API_ERROR")
 
-        if not cap.LocalReplaySupport():
-            cap.Shutdown()
-            return make_error("Capture cannot be replayed on this machine", "API_ERROR")
+        remote = None
+        if remote_host:
+            remote_status, remote = rd.CreateRemoteServerConnection(remote_host)
+            if remote_status != rd.ResultCode.Succeeded:
+                cap.Shutdown()
+                return make_error(
+                    f"Failed to connect to remote server at {remote_host}: {remote_status}",
+                    "REMOTE_CONNECT_ERROR",
+                )
 
-        result, controller = cap.OpenCapture(rd.ReplayOptions(), None)
-        if result != rd.ResultCode.Succeeded:
-            cap.Shutdown()
-            return make_error(f"Failed to initialize replay: {result}", "API_ERROR")
+            remote_path = remote.CopyCaptureToRemote(filepath, None)
+            if not remote_path:
+                remote.ShutdownConnection()
+                cap.Shutdown()
+                return make_error(
+                    f"Failed to copy capture to remote host {remote_host}", "REMOTE_COPY_ERROR"
+                )
+
+            # NoPreference asks the remote to replay with its own native
+            # driver rather than proxying through a local one - what we want
+            # when the remote device's GPU matches the capture.
+            result, controller = remote.OpenCapture(
+                rd.RemoteServer.NoPreference, remote_path, rd.ReplayOptions(), None
+            )
+            if result != rd.ResultCode.Succeeded:
+                remote.ShutdownConnection()
+                cap.Shutdown()
+                return make_error(
+                    f"Failed to initialize remote replay on {remote_host}: {result}", "API_ERROR"
+                )
+        else:
+            if not cap.LocalReplaySupport():
+                cap.Shutdown()
+                return make_error("Capture cannot be replayed on this machine", "API_ERROR")
+
+            result, controller = cap.OpenCapture(rd.ReplayOptions(), None)
+            if result != rd.ResultCode.Succeeded:
+                cap.Shutdown()
+                return make_error(f"Failed to initialize replay: {result}", "API_ERROR")
 
         self._cap = cap
         self._controller = controller
+        self._remote = remote
+        self._remote_host = remote_host
         self._filepath = filepath
         self._current_event = None
         self._structured_file = controller.GetStructuredFile()
@@ -122,6 +169,7 @@ class RenderDocSession:
         return {
             "filepath": filepath,
             "api": cap.DriverName(),
+            "remote_host": remote_host,
             "total_actions": len(self._action_map),
             "root_actions": len(root_actions),
             "textures": len(textures),
@@ -149,10 +197,19 @@ class RenderDocSession:
             return {"status": "no capture was open"}
 
         filepath = self._filepath
-        self._controller.Shutdown()
+        if self._remote is not None:
+            # Controller is owned by the remote server connection; closing it
+            # tears down replay on the remote side, then disconnect (leaves
+            # the remote server process itself running on the device).
+            self._remote.CloseCapture(self._controller)
+            self._remote.ShutdownConnection()
+        else:
+            self._controller.Shutdown()
         self._cap.Shutdown()
         self._controller = None
         self._cap = None
+        self._remote = None
+        self._remote_host = None
         self._filepath = None
         self._current_event = None
         self._action_map = {}

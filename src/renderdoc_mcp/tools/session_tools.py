@@ -47,7 +47,7 @@ def _get_gpu_quirks(driver_name: str) -> list[str]:
 
 def register(mcp: FastMCP):
     @mcp.tool()
-    def open_capture(filepath: str) -> str:
+    def open_capture(filepath: str, remote_host: str | None = None) -> str:
         """Open a RenderDoc capture (.rdc) file for analysis.
 
         Automatically closes any previously opened capture.
@@ -55,10 +55,17 @@ def register(mcp: FastMCP):
 
         Args:
             filepath: Absolute path to the .rdc capture file.
+            remote_host: Optional RenderDoc remote server address
+                (e.g. "127.0.0.1:39920") to replay on instead of the local
+                GPU. Use this when the capture needs hardware features the
+                local GPU lacks, such as ETC2 texture compression on a
+                capture made on a mobile device - point this at a RenderDoc
+                remote server running on (or adb-forwarded from) that
+                device.
         """
         filepath = os.path.normpath(filepath)
         session = get_session()
-        result = session.open(filepath)
+        result = session.open(filepath, remote_host=remote_host)
         return to_json(result)
 
     @mcp.tool()
@@ -105,6 +112,7 @@ def register(mcp: FastMCP):
         info = {
             "filepath": session.filepath,
             "api": driver_name,
+            "remote_host": session.remote_host,
             "resolution": resolution,
             "main_color_format": main_color_format,
             "total_actions": len(session.action_map),
