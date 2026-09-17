@@ -78,37 +78,43 @@ def _serialize_pipeline_state(state) -> dict:
 
     # Viewports and scissors
     try:
-        viewports = state.GetViewports()
-        result["viewports"] = [_serialize_viewport(vp) for vp in viewports]
+        viewports = []
+        for i in range(16):
+            vp = state.GetViewport(i)
+            if vp.width == 0 and vp.height == 0 and vp.x == 0 and vp.y == 0:
+                break
+            viewports.append(_serialize_viewport(vp))
+        result["viewports"] = viewports
     except Exception as e:
         warnings.append(f"viewports: {type(e).__name__}: {e}")
 
     try:
-        scissors = state.GetScissors()
-        result["scissors"] = [_serialize_scissor(sc) for sc in scissors]
+        scissors = []
+        for i in range(16):
+            sc = state.GetScissor(i)
+            if sc.width == 0 and sc.height == 0 and sc.x == 0 and sc.y == 0:
+                break
+            scissors.append(_serialize_scissor(sc))
+        result["scissors"] = scissors
     except Exception as e:
         warnings.append(f"scissors: {type(e).__name__}: {e}")
 
     # Rasterizer state
     try:
-        raster = state.GetRasterizer()
+        raster = state.GetRasterState()
         result["rasterizer"] = {
             "fill_mode": enum_str(raster.fillMode, FILL_MODE_MAP, "FillMode."),
             "cull_mode": enum_str(raster.cullMode, CULL_MODE_MAP, "CullMode."),
             "front_ccw": raster.frontCCW,
-            "depth_bias": raster.depthBias,
-            "depth_clip": raster.depthClip,
-            "scissor_enable": raster.scissorEnable,
-            "multisample_enable": raster.multisampleEnable,
         }
     except Exception as e:
         warnings.append(f"rasterizer: {type(e).__name__}: {e}")
 
     # Color blend
     try:
-        cb = state.GetColorBlend()
+        blend_list = state.GetColorBlends()
         blends = []
-        for b in cb.blends:
+        for b in blend_list:
             color_eq = _serialize_blend_eq(b.colorBlend)
             alpha_eq = _serialize_blend_eq(b.alphaBlend)
             entry = {
@@ -123,8 +129,9 @@ def _serialize_pipeline_state(state) -> dict:
                     alpha_eq["source"], alpha_eq["destination"], alpha_eq["operation"],
                 )
             blends.append(entry)
+        bf = state.GetBlendFactor()
         result["color_blend"] = {
-            "blend_factor": [cb.blendFactor.x, cb.blendFactor.y, cb.blendFactor.z, cb.blendFactor.w],
+            "blend_factor": [bf[0], bf[1], bf[2], bf[3]],
             "blends": blends,
         }
     except Exception as e:
@@ -132,7 +139,7 @@ def _serialize_pipeline_state(state) -> dict:
 
     # Depth state
     try:
-        ds = state.GetDepthState()
+        ds = state.GetDepthTestState()
         result["depth_state"] = {
             "depth_enable": ds.depthEnable,
             "depth_function": enum_str(ds.depthFunction, COMPARE_FUNC_MAP, "CompareFunc."),
@@ -143,9 +150,8 @@ def _serialize_pipeline_state(state) -> dict:
 
     # Stencil state
     try:
-        ss = state.GetStencilState()
         result["stencil_state"] = {
-            "stencil_enable": ss.stencilEnable,
+            "stencil_enable": state.IsStencilTestEnabled(),
         }
     except Exception as e:
         warnings.append(f"stencil_state: {type(e).__name__}: {e}")
@@ -437,9 +443,9 @@ def _get_draw_state_dict(session, event_id: int) -> dict:
 
     # Blend state (first enabled blend target)
     try:
-        cb = state.GetColorBlend()
-        if cb.blends:
-            b = cb.blends[0]
+        blend_list = state.GetColorBlends()
+        if blend_list:
+            b = blend_list[0]
             color_eq = _serialize_blend_eq(b.colorBlend)
             alpha_eq = _serialize_blend_eq(b.alphaBlend)
             blend_info: dict = {
@@ -462,7 +468,7 @@ def _get_draw_state_dict(session, event_id: int) -> dict:
 
     # Depth state
     try:
-        ds = state.GetDepthState()
+        ds = state.GetDepthTestState()
         result["depth"] = {
             "test": ds.depthEnable,
             "write": ds.depthWrites,
@@ -473,14 +479,13 @@ def _get_draw_state_dict(session, event_id: int) -> dict:
 
     # Stencil state
     try:
-        ss = state.GetStencilState()
-        result["stencil"] = {"enabled": ss.stencilEnable}
+        result["stencil"] = {"enabled": state.IsStencilTestEnabled()}
     except Exception as e:
         warnings.append(f"stencil: {type(e).__name__}: {e}")
 
     # Rasterizer
     try:
-        raster = state.GetRasterizer()
+        raster = state.GetRasterState()
         result["rasterizer"] = {
             "cull": enum_str(raster.cullMode, CULL_MODE_MAP, "CullMode."),
             "fill": enum_str(raster.fillMode, FILL_MODE_MAP, "FillMode."),

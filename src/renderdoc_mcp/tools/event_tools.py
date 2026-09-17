@@ -271,8 +271,8 @@ def register(mcp: FastMCP):
 
                 if blend is not None:
                     try:
-                        cb = state.GetColorBlend()
-                        blend_enabled = cb.blends[0].enabled if cb.blends else False
+                        blends = state.GetColorBlends()
+                        blend_enabled = blends[0].enabled if blends else False
                         if blend_enabled != blend:
                             continue
                     except Exception:
