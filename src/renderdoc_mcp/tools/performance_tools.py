@@ -508,22 +508,22 @@ def register(mcp: FastMCP):
 
             if "blend" in track:
                 try:
-                    cb = state.GetColorBlend()
-                    b = cb.blends[0] if cb.blends else None
+                    blends = state.GetColorBlends()
+                    b = blends[0] if blends else None
                     cur_state["blend"] = (b.enabled, int(b.colorBlend.source), int(b.colorBlend.destination)) if b else None
                 except Exception:
                     cur_state["blend"] = None
 
             if "depth" in track:
                 try:
-                    ds = state.GetDepthState()
+                    ds = state.GetDepthTestState()
                     cur_state["depth"] = (ds.depthEnable, int(ds.depthFunction))
                 except Exception:
                     cur_state["depth"] = None
 
             if "cull" in track:
                 try:
-                    raster = state.GetRasterizer()
+                    raster = state.GetRasterState()
                     cur_state["cull"] = int(raster.cullMode)
                 except Exception:
                     cur_state["cull"] = None

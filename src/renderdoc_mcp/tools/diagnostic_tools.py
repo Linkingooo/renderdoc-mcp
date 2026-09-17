@@ -498,11 +498,11 @@ def register(mcp: FastMCP):
 
                 # Blend comparison
                 try:
-                    ncb = ns.GetColorBlend()
-                    rcb = rs.GetColorBlend()
-                    if ncb.blends and rcb.blends:
-                        nb0 = ncb.blends[0]
-                        rb0 = rcb.blends[0]
+                    ncb = ns.GetColorBlends()
+                    rcb = rs.GetColorBlends()
+                    if ncb and rcb:
+                        nb0 = ncb[0]
+                        rb0 = rcb[0]
                         if nb0.enabled != rb0.enabled:
                             causes.append({
                                 "factor": "blend_state",

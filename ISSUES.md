@@ -81,3 +81,18 @@
 - **问题**: `result_or_raise` 未使用；工具直接访问 `session._action_map`/`session._cap`
 - **修复**: 删除死代码，在 session 上加公共访问方法
 - **状态**: ✅ 已修复
+
+## P0 — 新发现（针对当前 RenderDoc 2026 API）
+
+### 13. `PipeState` 方法名过时 → 管线状态全部丢失
+- **文件**: `pipeline_tools.py` (4 处), `event_tools.py` (1 处), `performance_tools.py` (3 处), `diagnostic_tools.py` (2 处)
+- **问题**: 使用旧 API 名，当前 RenderDoc 中不存在，全部抛 `AttributeError` 被吞进 `warnings`：
+  - `GetColorBlend()` → 现为 `GetColorBlends()`（直接返回 `List[ColorBlend]`）；混合因子用 `GetBlendFactor()`
+  - `GetDepthState()` → 现为 `GetDepthTestState()`
+  - `GetStencilState()` → 现为 `IsStencilTestEnabled()`（`stencilEnable` 已移除）
+  - `GetRasterizer()` → 现为 `GetRasterState()`（仅 `frontCCW`/`fillMode`/`cullMode`，无 `depthBias`/`depthClip`/`scissorEnable`/`multisampleEnable`）
+  - `GetViewports()`/`GetScissors()` → 现为 `GetViewport(i)`/`GetScissor(i)`（需按索引枚举）
+- **影响**: `get_draw_call_state`/`get_pipeline_state` 丢失 blend/depth/stencil/rasterizer/viewport；`find_draws(blend=)`、`analyze_state_changes`、`diagnose_reflection_mismatch` 的 blend/depth/cull 对比失效
+- **修复**: 改用当前 API 名；viewport/scissor 按索引 0..15 枚举、遇空值停止
+- **验证**: 4 个 D3D11 capture（draw_zoo/texture_zoo/mesh_zoo/cbuffer_zoo）实测全部工具无 warnings
+- **状态**: ✅ 已修复（需重启 MCP 服务生效）
