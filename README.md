@@ -243,10 +243,29 @@ set_event(142)                                    # Navigate to a draw call
 
 | Tool | Description |
 |------|-------------|
-| `get_pass_timing` | Most expensive render passes — uses GPU counters if available, falls back to triangle-count heuristic |
+| `get_pass_timing` | Replay draw GPU duration counters with explicit units, missing/invalid values and group coverage |
 | `analyze_overdraw` | Overdraw estimate per render target group |
 | `analyze_bandwidth` | Write/read bandwidth estimate per render target |
 | `analyze_state_changes` | Finds redundant state-change patterns and batching opportunities |
+
+### Timing result semantics
+
+`get_pass_timing` selects RenderDoc's `GPUCounter.EventGPUDuration`, rather than a
+counter whose display name happens to contain "time". It decodes `CounterValue`
+according to `CounterDescription.resultType` and `resultByteWidth`, and converts
+`CounterUnit.Seconds` to milliseconds. Unsupported units/types and unavailable,
+missing or invalid results carry a reason and a null duration; a valid zero stays
+zero. Triangle counts are never used as timing values.
+
+`gpu_duration_ms` is the measured value; the retained `estimated_cost` field is a
+legacy alias in milliseconds and is null when no valid measurement exists.
+`has_real_timing` means at least one draw has a valid **replay** counter result,
+not that all draws were timed or that capture-device frame time was measured.
+Use `timing_status`, `timing_reason`, `counter` metadata and `timing_coverage` to
+interpret completeness. Coverage describes the entire queried scope, before
+`top_n` truncation. Pass entries keep the existing Clear/output-target heuristic
+groups, report their own coverage, and sum only valid draw durations. Complete
+groups rank before partial subtotals; neither is whole-frame elapsed GPU time.
 
 ### Diagnostics (4)
 
