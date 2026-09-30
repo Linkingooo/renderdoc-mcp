@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -19,6 +20,103 @@ from renderdoc_mcp.util import (
 )
 
 
+def _fetch_event_timing(controller) -> dict:
+    """Read only RenderDoc's event GPU duration, following CounterDescription."""
+    timing = {"counter": None, "events": {}, "unavailable_reason": None}
+    try:
+        counters = controller.EnumerateCounters()
+    except Exception as exc:
+        timing["unavailable_reason"] = f"counter_enumeration_failed:{type(exc).__name__}"
+        return timing
+    counter = rd.GPUCounter.EventGPUDuration
+    if counter not in counters:
+        timing["unavailable_reason"] = "gpu_duration_counter_unavailable"
+        return timing
+    try:
+        description = controller.DescribeCounter(counter)
+        kind, width, unit = description.resultType, description.resultByteWidth, description.unit
+        timing["counter"] = {
+            "id": int(counter), "name": description.name,
+            "result_type": getattr(kind, "name", str(kind)), "result_byte_width": width,
+            "unit": "Seconds" if unit == rd.CounterUnit.Seconds else getattr(unit, "name", str(unit)),
+        }
+    except Exception as exc:
+        timing["unavailable_reason"] = f"counter_description_failed:{type(exc).__name__}"
+        return timing
+    if unit != rd.CounterUnit.Seconds:
+        timing["unavailable_reason"] = "unsupported_counter_unit"
+        return timing
+    if kind == rd.CompType.Float and width in (4, 8):
+        member = "f" if width == 4 else "d"
+    elif kind == getattr(rd.CompType, "Double", None) and width == 8:
+        member = "d"
+    elif kind == rd.CompType.UInt and width in (4, 8):
+        member = "u32" if width == 4 else "u64"
+    else:
+        timing["unavailable_reason"] = "unsupported_counter_type_or_width"
+        return timing
+    try:
+        results = controller.FetchCounters([counter])
+    except Exception as exc:
+        timing["unavailable_reason"] = f"counter_fetch_failed:{type(exc).__name__}"
+        return timing
+    for result in results:
+        if result.counter != counter:
+            continue
+        event = result.eventId
+        reason = None
+        duration = None
+        if event in timing["events"]:
+            reason = "duplicate_counter_result"
+        else:
+            try:
+                raw = getattr(result.value, member)
+                if isinstance(raw, bool):
+                    raise ValueError("Boolean counter value")
+                if member.startswith("u") and (not isinstance(raw, int) or not 0 <= raw < 2 ** (width * 8)):
+                    raise ValueError("Unsigned value out of range")
+                duration = float(raw) * 1000.0  # CounterUnit.Seconds -> milliseconds.
+                if not math.isfinite(duration) or duration < 0:
+                    reason = "invalid_counter_value"
+                    duration = None
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                reason = "invalid_counter_value"
+        timing["events"][event] = {"gpu_duration_ms": duration,
+                                    "timing_status": "invalid" if reason else "valid",
+                                    "timing_reason": reason}
+    return timing
+
+
+def _event_timing(event: int, timing: dict) -> dict:
+    return timing["events"].get(event, {
+        "gpu_duration_ms": None, "timing_status": "missing",
+        "timing_reason": timing["unavailable_reason"] or "event_result_missing",
+    })
+
+
+def _timing_summary(events: list[int], timing: dict) -> dict:
+    samples = [_event_timing(event, timing) for event in events]
+    valid = [sample["gpu_duration_ms"] for sample in samples if sample["timing_status"] == "valid"]
+    coverage = {"total_draws": len(events), "valid_draws": len(valid),
+                "missing_draws": sum(sample["timing_status"] == "missing" for sample in samples),
+                "invalid_draws": sum(sample["timing_status"] == "invalid" for sample in samples),
+                "complete": bool(events) and len(valid) == len(events)}
+    status = "complete" if coverage["complete"] else "partial" if valid else "unavailable" if events else "no_draws"
+    reason = timing["unavailable_reason"]
+    reasons = {}
+    for sample in samples:
+        if sample["timing_reason"]:
+            reasons[sample["timing_reason"]] = reasons.get(sample["timing_reason"], 0) + 1
+    if reason is None and reasons:
+        reason = "incomplete_counter_coverage" if valid else "no_valid_counter_results"
+    try:
+        duration = math.fsum(valid) if valid else None
+    except OverflowError:
+        duration, status, reason = None, "invalid", "aggregate_duration_out_of_range"
+    return {"gpu_duration_ms": duration, "timing_status": status,
+            "timing_reason": reason, "timing_reasons": reasons, "timing_coverage": coverage}
+
+
 def register(mcp: FastMCP):
 
     @mcp.tool()
@@ -26,135 +124,92 @@ def register(mcp: FastMCP):
         granularity: str = "pass",
         top_n: int = 20,
     ) -> str:
-        """Get per-render-pass or per-draw-call GPU timing estimates.
+        """Get measured replay GPU durations for draws or heuristic RT groups.
 
-        Note: True GPU timing requires counter support in the capture. When counters
-        are unavailable, this tool falls back to heuristic estimates based on draw
-        call complexity (vertex count × texture count).
+        Uses EventGPUDuration and CounterDescription to decode the result and
+        convert seconds to milliseconds. Missing/invalid values stay null;
+        geometry counts are never substituted for time. Group totals report
+        coverage and sum only valid draw durations, not whole-frame elapsed time.
 
         Args:
-            granularity: "pass" (group by render pass, default) or "draw_call" (per draw).
-            top_n: Return only the top N most expensive entries (default 20).
+            granularity: "pass" (Clear/RT groups) or "draw_call" (per draw).
+            top_n: Return at most this many entries, retaining full-scope coverage.
         """
         session = get_session()
         err = session.require_open()
         if err:
             return to_json(err)
+        if granularity not in ("pass", "draw_call"):
+            return to_json(make_error("granularity must be pass or draw_call", "API_ERROR"))
 
-        # Try GPU counters first
-        counter_data: dict[int, float] = {}
-        has_real_timing = False
-        try:
-            counters = session.controller.EnumerateCounters()
-            timing_counter = None
-            for c in counters:
-                info = session.controller.DescribeCounter(c)
-                if "time" in info.name.lower() or "duration" in info.name.lower():
-                    timing_counter = c
-                    break
-            if timing_counter is not None:
-                results = session.controller.FetchCounters([timing_counter])
-                for r in results:
-                    counter_data[r.eventId] = r.value.d
-                has_real_timing = True
-        except Exception:
-            pass
-
+        timing = _fetch_event_timing(session.controller)
         sf = session.structured_file
-
+        draws = [eid for eid in sorted(session.action_map)
+                 if session.action_map[eid].flags & rd.ActionFlags.Drawcall]
+        summary = _timing_summary(draws, timing)
+        metadata = {
+            "has_real_timing": summary["timing_coverage"]["valid_draws"] > 0,
+            "timing_source": "gpu_counter_replay", "counter": timing["counter"],
+            "timing_unit": "ms" if timing["counter"] and timing["counter"]["unit"] == "Seconds" else None,
+            "timing_status": summary["timing_status"], "timing_reason": summary["timing_reason"],
+            "timing_reasons": summary["timing_reasons"],
+            "timing_coverage": summary["timing_coverage"],
+            "note": "Replay draw durations are not capture-device frame time. Missing or invalid results stay null; partial group totals sum measured draws only. Clear/RT groups are heuristic, not native render passes.",
+        }
         if granularity == "draw_call":
-            entries: list[dict] = []
-            for eid in sorted(session.action_map.keys()):
+            entries = []
+            for eid in draws:
                 action = session.action_map[eid]
-                if not (action.flags & rd.ActionFlags.Drawcall):
-                    continue
-                cost = counter_data.get(eid, action.numIndices / 3)  # heuristic: triangles
-                entries.append({
-                    "event_id": eid,
-                    "name": action.GetName(sf),
-                    "vertex_count": action.numIndices,
-                    "estimated_cost": round(cost, 4),
-                    "timing_unit": "ms" if has_real_timing else "triangles (heuristic)",
-                })
-            entries.sort(key=lambda e: -e["estimated_cost"])
-            return to_json({
-                "granularity": "draw_call",
-                "has_real_timing": has_real_timing,
-                "top_n": top_n,
-                "entries": entries[:top_n],
-                "total_draw_calls": len(entries),
-                "note": "" if has_real_timing else "GPU timing counters unavailable — showing triangle counts as proxy",
-            })
+                sample = _event_timing(eid, timing)
+                entries.append({"event_id": eid, "name": action.GetName(sf),
+                                "vertex_count": action.numIndices, **sample,
+                                "estimated_cost": sample["gpu_duration_ms"],  # Legacy measured-ms alias.
+                                "timing_unit": metadata["timing_unit"]})
+            entries.sort(key=lambda entry: (entry["timing_status"] != "valid", -(entry["gpu_duration_ms"] or 0)))
+            return to_json({"granularity": granularity, **metadata, "top_n": top_n,
+                            "entries": entries[:top_n], "total_draw_calls": len(entries)})
 
-        # Pass-level: group by consecutive render target set
-        passes: list[dict] = []
-        current: dict | None = None
-        last_outputs: tuple | None = None
-
-        for eid in sorted(session.action_map.keys()):
+        # Retain the existing Clear/output-target grouping; it is not native-pass reconstruction.
+        passes = []
+        current = None
+        last_outputs = None
+        for eid in sorted(session.action_map):
             action = session.action_map[eid]
             is_clear = bool(action.flags & rd.ActionFlags.Clear)
             is_draw = bool(action.flags & rd.ActionFlags.Drawcall)
             if not is_clear and not is_draw:
                 continue
-
-            outputs = tuple(str(o) for o in action.outputs if int(o) != 0)
-            if is_clear or (outputs and outputs != last_outputs):
+            outputs = tuple(str(output) for output in action.outputs if int(output) != 0)
+            if current is None or is_clear or (outputs and outputs != last_outputs):
                 if current is not None:
                     passes.append(current)
-                current = {
-                    "pass_index": len(passes),
-                    "start_event": eid,
-                    "end_event": eid,
-                    "name": action.GetName(sf),
-                    "draw_count": 0,
-                    "total_vertices": 0,
-                    "estimated_cost": 0.0,
-                    "render_targets": list(outputs),
-                }
-            if current is None:
-                current = {
-                    "pass_index": 0,
-                    "start_event": eid,
-                    "end_event": eid,
-                    "name": action.GetName(sf),
-                    "draw_count": 0,
-                    "total_vertices": 0,
-                    "estimated_cost": 0.0,
-                    "render_targets": list(outputs),
-                }
+                current = {"pass_index": len(passes), "start_event": eid, "end_event": eid,
+                           "name": action.GetName(sf), "draw_count": 0, "total_vertices": 0,
+                           "render_targets": list(outputs), "_draw_events": []}
             current["end_event"] = eid
             if is_draw:
                 current["draw_count"] += 1
                 current["total_vertices"] += action.numIndices
-                cost = counter_data.get(eid, action.numIndices / 3)
-                current["estimated_cost"] += cost
+                current["_draw_events"].append(eid)
             if outputs:
                 last_outputs = outputs
-
         if current is not None:
             passes.append(current)
-
-        # Enrich with RT info
-        for p in passes:
+        for group in passes:
             rt_infos = []
-            for rid_str in p["render_targets"]:
-                td = session.get_texture_desc(rid_str)
-                if td:
-                    rt_infos.append(f"{td.width}x{td.height} {td.format.Name()}")
-            p["rt_summary"] = ", ".join(rt_infos) if rt_infos else "unknown"
-            p["estimated_cost"] = round(p["estimated_cost"], 4)
-
-        passes.sort(key=lambda p: -p["estimated_cost"])
-        return to_json({
-            "granularity": "pass",
-            "has_real_timing": has_real_timing,
-            "top_n": top_n,
-            "passes": passes[:top_n],
-            "total_passes": len(passes),
-            "timing_unit": "ms" if has_real_timing else "triangles (heuristic)",
-            "note": "" if has_real_timing else "GPU timing counters unavailable — pass cost estimated from triangle counts",
-        })
+            for resource in group["render_targets"]:
+                description = session.get_texture_desc(resource)
+                if description:
+                    rt_infos.append(f"{description.width}x{description.height} {description.format.Name()}")
+            group["rt_summary"] = ", ".join(rt_infos) or "unknown"
+            group.update(_timing_summary(group.pop("_draw_events"), timing))
+            group["estimated_cost"] = group["gpu_duration_ms"]  # Legacy measured-ms alias.
+        # Complete totals rank first, partial subtotals next, unavailable groups last.
+        order = {"complete": 0, "partial": 1}
+        passes.sort(key=lambda group: (order.get(group["timing_status"], 2), -(group["gpu_duration_ms"] or 0)))
+        return to_json({"granularity": granularity, **metadata, "top_n": top_n,
+                        "passes": passes[:top_n], "total_passes": len(passes),
+                        "grouping_source": "clear_and_output_target_heuristic"})
 
     @mcp.tool()
     def analyze_overdraw(
