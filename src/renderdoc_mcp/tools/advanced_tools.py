@@ -163,13 +163,13 @@ def register(mcp: FastMCP):
         # Build diagnosis hint
         hints: list[str] = []
         if inf_count > 0:
-            hints.append(f"Inf 像素 {inf_count} 个——建议对这些像素执行 pixel_history 追踪来源")
+            hints.append(f"{inf_count} Inf pixels - run pixel_history on them to trace the source")
         if neg_count > 0:
-            hints.append(f"负值像素 {neg_count} 个——可能来自 IBL SH 采样或 HDR 溢出，建议检查写入该 RT 的 draw call")
+            hints.append(f"{neg_count} negative pixels - possibly from IBL SH sampling or HDR overflow; check the draw calls writing this RT")
         if nan_count > 0:
-            hints.append(f"NaN 像素 {nan_count} 个——通常由除以零或 0/0 运算引起")
+            hints.append(f"{nan_count} NaN pixels - usually caused by division by zero or 0/0")
         if bright_count > 0:
-            hints.append(f"极亮像素 {bright_count} 个（>{anomaly_threshold}）——可能溢出或曝光异常")
+            hints.append(f"{bright_count} very bright pixels (>{anomaly_threshold}) - possible overflow or exposure anomaly")
 
         result = {
             "resource_id": resource_id,
@@ -296,11 +296,11 @@ def register(mcp: FastMCP):
                                 if isinstance(val, list):
                                     flat = [v for v in val if isinstance(v, (int, float))]
                                     if any(math.isnan(v) for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} 包含 NaN"
+                                        sv["warning"] = f"⚠️ {vname} contains NaN"
                                     elif any(math.isinf(v) for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} 包含 Inf"
+                                        sv["warning"] = f"⚠️ {vname} contains Inf"
                                     elif any(v < 0 for v in flat):
-                                        sv["warning"] = f"⚠️ {vname} 包含负值: {flat}"
+                                        sv["warning"] = f"⚠️ {vname} contains negative values: {flat}"
                                 changed.append(sv)
                         if changed:
                             step["variables"] = changed
@@ -568,8 +568,8 @@ def register(mcp: FastMCP):
             "differences": differences,
             "identical": len(differences) == 0,
             "summary": (
-                f"发现 {len(differences)} 处差异" if differences
-                else "两个 draw call 的 pipeline state 完全相同"
+                f"Found {len(differences)} difference(s)" if differences
+                else "The two draw calls have identical pipeline state"
             ),
         })
 
@@ -699,32 +699,32 @@ def _implication_for(suffix: str, v1, v2) -> str | None:
     """Return a human-readable implication string for a known diff field."""
     s1, s2 = str(v1), str(v2)
     if suffix == "blend.enabled":
-        detail = "透明度混合激活，颜色会与背景混合叠加" if v2 else "关闭 blend，输出将直接覆盖目标像素（不透明模式）"
-        return f"Blend toggle: {s1}→{s2}。{detail}"
+        detail = "Blending enabled; color is blended with the background" if v2 else "Blending disabled; output overwrites the target pixel (opaque mode)"
+        return f"Blend toggle: {s1}→{s2}. {detail}"
     if suffix == "blend.color_src":
-        return f"颜色源混合因子: {s1}→{s2}。可能导致输出颜色亮度/透明度变化"
+        return f"Color source blend factor: {s1}→{s2}. May change output color brightness/opacity"
     if suffix == "blend.color_dst":
-        return f"颜色目标混合因子: {s1}→{s2}。影响背景色在最终结果中的权重"
+        return f"Color destination blend factor: {s1}→{s2}. Changes the weight of the background color in the result"
     if suffix == "blend.color_op":
-        return f"颜色混合运算: {s1}→{s2}。运算方式改变可能导致颜色整体偏移"
+        return f"Color blend operation: {s1}→{s2}. A different operation may shift the overall color"
     if suffix == "blend.alpha_src":
-        return f"Alpha 源混合因子: {s1}→{s2}"
+        return f"Alpha source blend factor: {s1}→{s2}"
     if suffix == "depth.test":
-        detail = "关闭后物体可能穿透其他几何体" if not v2 else "开启后需要确保深度 buffer 正确初始化"
-        return f"深度测试: {s1}→{s2}。{detail}"
+        detail = "Objects may pass through other geometry when disabled" if not v2 else "Make sure the depth buffer is initialized correctly when enabled"
+        return f"Depth test: {s1}→{s2}. {detail}"
     if suffix == "depth.write":
-        detail = "关闭后该 draw call 不更新深度 buffer，适用于透明物体" if not v2 else "开启后会更新深度值"
-        return f"深度写入: {s1}→{s2}。{detail}"
+        detail = "When disabled, this draw call does not update the depth buffer (suits transparent objects)" if not v2 else "When enabled, depth values are updated"
+        return f"Depth write: {s1}→{s2}. {detail}"
     if suffix == "depth.func":
-        return f"深度比较函数: {s1}→{s2}。可能导致物体遮挡关系或消失问题"
+        return f"Depth compare function: {s1}→{s2}. May cause occlusion order changes or objects disappearing"
     if suffix == "stencil.enabled":
-        return f"模板测试: {s1}→{s2}"
+        return f"Stencil test: {s1}→{s2}"
     if suffix == "rasterizer.cull":
-        return f"剔除模式: {s1}→{s2}。可能影响背面/正面可见性，倒影 pass 通常需要反转 cull"
+        return f"Cull mode: {s1}→{s2}. May affect back/front face visibility; reflection passes usually need inverted culling"
     if suffix == "rasterizer.front_ccw":
-        return f"正面朝向: {s1}→{s2}。CCW/CW 切换后背面剔除方向翻转"
+        return f"Front face: {s1}→{s2}. Switching CCW/CW flips the back-face culling direction"
     if suffix == "topology":
-        return f"图元拓扑: {s1}→{s2}"
+        return f"Primitive topology: {s1}→{s2}"
     return None
 
 _IMPLICATION_SUFFIXES = [

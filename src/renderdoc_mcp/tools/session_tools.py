@@ -17,30 +17,30 @@ def _get_gpu_quirks(driver_name: str) -> list[str]:
 
     if "ADRENO" in name_upper:
         quirks.extend([
-            "Adreno: mediump float 实际精度可能低于 spec 要求，关键计算建议强制 highp",
-            "Adreno: R11G11B10_FLOAT 没有符号位，写入负值会被 clamp 到 0 或产生未定义行为",
-            "Adreno: 某些驱动版本 textureLod 在 fragment shader 中存在 bug",
+            "Adreno: mediump float actual precision may be lower than the spec requires; force highp for critical computations",
+            "Adreno: R11G11B10_FLOAT has no sign bit; writing negative values is clamped to 0 or produces undefined behavior",
+            "Adreno: textureLod is buggy in fragment shaders on some driver versions",
         ])
     elif "MALI" in name_upper:
         quirks.extend([
-            "Mali: R11G11B10_FLOAT 存储负值行为未定义",
-            "Mali: 大量 discard 指令会导致 early-Z 失效，影响 tile-based 性能",
-            "Mali: 某些型号 mediump 向量运算累积精度问题",
+            "Mali: R11G11B10_FLOAT storing negative values is undefined behavior",
+            "Mali: heavy use of discard disables early-Z and hurts tile-based performance",
+            "Mali: mediump vector math accumulates precision error on some models",
         ])
     elif "POWERVR" in name_upper or "IMAGINATION" in name_upper:
         quirks.extend([
-            "PowerVR: Tile-based deferred rendering，避免不必要的 framebuffer load/store",
-            "PowerVR: 避免大量纹理采样器绑定",
+            "PowerVR: Tile-based deferred rendering; avoid unnecessary framebuffer load/store",
+            "PowerVR: avoid binding many texture samplers",
         ])
     elif "APPLE" in name_upper:
         quirks.extend([
-            "Apple GPU: High-efficiency TBDR，注意 tile memory 带宽",
-            "Apple: float16 在 Metal 上性能优秀，建议用于后处理",
+            "Apple GPU: High-efficiency TBDR; watch tile memory bandwidth",
+            "Apple: float16 performs well on Metal; recommended for post-processing",
         ])
 
     if "OPENGL ES" in name_upper or "GLES" in name_upper:
-        quirks.append("OpenGL ES: 注意精度限定符 (highp/mediump/lowp) 的正确使用")
-        quirks.append("OpenGL ES: 扩展依赖需检查 GL_EXTENSIONS 兼容性")
+        quirks.append("OpenGL ES: use precision qualifiers (highp/mediump/lowp) correctly")
+        quirks.append("OpenGL ES: check GL_EXTENSIONS for extension dependencies")
 
     return quirks
 

@@ -282,9 +282,9 @@ def register(mcp: FastMCP):
 
         hint = ""
         if severity == "high":
-            hint = f"平均 overdraw {avg_overdraw:.1f}x 偏高。建议检查半透明物体排序、减少粒子层数、启用 early-Z 裁剪。"
+            hint = f"Average overdraw {avg_overdraw:.1f}x is high. Check transparent object sorting, reduce particle layers, enable early-Z culling."
         elif severity == "medium":
-            hint = f"平均 overdraw {avg_overdraw:.1f}x 适中。移动端 fill rate 有限，可考虑减少不必要的全屏 pass。"
+            hint = f"Average overdraw {avg_overdraw:.1f}x is moderate. Mobile fill rate is limited; consider removing unnecessary full-screen passes."
 
         return to_json({
             "total_draws_analyzed": total_draws,
@@ -411,7 +411,7 @@ def register(mcp: FastMCP):
         for st in rt_stats.values():
             if st["clear_count"] > 1:
                 tile_warnings.append(
-                    f"{st['name']}: {st['clear_count']} 次 clear，每次 clear 在 tile-based GPU 上触发 tile store+load，建议合并为单次 clear"
+                    f"{st['name']}: {st['clear_count']} clears; each clear triggers a tile store+load on tile-based GPUs, consider merging into a single clear"
                 )
 
         if breakdown_by == "resource_type":
@@ -566,12 +566,12 @@ def register(mcp: FastMCP):
 
         suggestions: list[str] = []
         if change_counts.get("shader", 0) > analyzed // 3:
-            suggestions.append(f"Shader 切换 {change_counts['shader']} 次（每 {analyzed//max(change_counts['shader'],1)} 次 draw 切换一次）——考虑按 shader 排序批次")
+            suggestions.append(f"Shader changes: {change_counts['shader']} (one per {analyzed//max(change_counts['shader'],1)} draws) - consider sorting batches by shader")
         if change_counts.get("render_target", 0) > 5:
-            suggestions.append(f"Render target 切换 {change_counts['render_target']} 次——每次切换在 tile-based GPU 上触发 tile store/load")
+            suggestions.append(f"Render target changes: {change_counts['render_target']} - each change triggers a tile store/load on tile-based GPUs")
         if batching_runs and batching_runs[0]["count"] > 3:
             best = batching_runs[0]
-            suggestions.append(f"事件 {best['start_event']}–{best['end_event']} 共 {best['count']} 个连续 draw call 状态完全相同，可合并为 instanced draw")
+            suggestions.append(f"Events {best['start_event']}-{best['end_event']}: {best['count']} consecutive draw calls have identical state and can be merged into an instanced draw")
 
         return to_json({
             "analyzed_draws": analyzed,

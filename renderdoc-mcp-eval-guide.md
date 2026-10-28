@@ -1,357 +1,391 @@
-# RenderDoc MCP Server 自动化评估指南
+# RenderDoc MCP Server Automated Evaluation Guide
 
-> 本文档旨在提供一套结构化的评估框架，让 LLM 能够系统地验证一个 RenderDoc MCP Server 的质量。评估者（LLM）应逐步执行本文档中的测试用例，记录每个环节的结果，并在最后生成评估报告。
-
----
-
-## 一、评估前准备
-
-### 1.1 环境确认
-
-在开始评估之前，请先执行以下检查：
-
-1. 确认 MCP Server 已启动并可连接
-2. 调用 `tools/list` 获取所有可用工具的完整列表
-3. 调用 `resources/list` 获取所有可用资源的完整列表（如支持）
-4. 调用 `prompts/list` 获取所有可用提示模板的完整列表（如支持）
-5. 记录 Server 的名称、版本号及声明的能力范围
-
-### 1.2 评估输出模板
-
-每完成一个测试阶段，请按以下格式记录结果：
-
-```
-[阶段名称]
-- 测试项: <具体测试内容>
-- 结果: ✅ 通过 / ⚠️ 部分通过 / ❌ 失败
-- 详情: <具体表现描述>
-- 建议: <改进建议（如有）>
-```
+> This document provides a structured evaluation framework.
+> It lets an LLM systematically verify the quality of a RenderDoc MCP Server.
+> The evaluator (an LLM) should run the test cases in this document step by step.
+> Record the result of each step.
+> Produce an evaluation report at the end.
 
 ---
 
-## 二、工具定义质量评估（权重 25%）
+## 1. Pre-Evaluation Setup
 
-此阶段不需要实际调用工具，仅对工具的元信息（名称、描述、参数 schema）进行审查。
+### 1.1 Environment Check
 
-### 2.1 命名规范检查
+Before starting the evaluation, run these checks:
 
-逐一检查每个工具名称，回答以下问题：
+1. Confirm the MCP Server is running and reachable
+2. Call `tools/list` to get the full list of available tools
+3. Call `resources/list` to get the full list of available resources (if supported)
+4. Call `prompts/list` to get the full list of available prompt templates (if supported)
+5. Record the Server's name, version, and declared capabilities
 
-- 工具名称是否清晰表达了其功能？（如 `capture_frame` 优于 `doAction`）
-- 命名是否遵循一致的风格？（全部 snake_case 或全部 camelCase，不要混用）
-- 是否存在含义模糊或过于宽泛的名称？（如 `get_data`、`process`、`run`）
-- 是否有名称相似但功能不同的工具容易造成混淆？
+### 1.2 Evaluation Output Template
 
-**评分标准**：
-- ✅ 所有工具命名清晰、一致、无歧义
-- ⚠️ 多数工具命名良好，个别存在模糊
-- ❌ 命名混乱，多个工具难以区分
+After each test phase, record the result in this format:
 
-### 2.2 描述完整性检查
-
-对每个工具的 `description` 字段进行分析：
-
-- 是否说明了工具的用途和使用场景？
-- 是否说明了什么时候应该使用这个工具（而非其他工具）？
-- 是否说明了前置条件？（如"需要先调用 `load_capture` 加载 .rdc 文件"）
-- 是否说明了返回值的含义和格式？
-- 描述中是否使用了 RenderDoc 的专业术语并给出了足够的上下文？
-
-**测试方法**：仅根据工具的 description，尝试回答以下问题。如果无法回答，说明描述不完整：
-
-1. "我想查看某个 draw call 的输入纹理" → 应该用哪个工具？
-2. "我想对比两帧的性能差异" → 应该用哪个工具？
-3. "我想找到导致 overdraw 的 draw call" → 应该用哪个工具？
-
-### 2.3 参数 Schema 检查
-
-对每个工具的 `inputSchema` 逐一审查：
-
-- 每个参数是否有明确的 `type` 定义？
-- 是否区分了 `required` 和可选参数？
-- 枚举类型（如 shader stage、texture format）是否列出了所有合法值？
-- 参数的 `description` 是否解释了期望的输入？
-- 是否存在应该有默认值但没有设置的参数？
-- 数值参数是否设置了合理的范围约束（`minimum`/`maximum`）？
-
-**特别关注**：
-- `event_id` / `draw_call_id` 类型的参数：是否说明了如何获取合法的 ID？
-- 文件路径参数：是否说明了路径格式要求（绝对/相对路径）？
-- 坐标/像素参数：是否说明了坐标系原点和范围？
+```
+[Phase name]
+- Test item: <what was tested>
+- Result: ✅ Pass / ⚠️ Partial pass / ❌ Fail
+- Details: <observed behavior>
+- Suggestion: <improvement suggestion (if any)>
+```
 
 ---
 
-## 三、功能正确性评估（权重 25%）
+## 2. Tool Definition Quality (Weight 25%)
 
-此阶段需要实际调用工具，验证功能是否正常工作。需要先准备一个 RenderDoc 捕获文件（.rdc）。
+This phase does not require calling any tools.
+Review only the tool metadata: name, description, and parameter schema.
 
-### 3.1 基本工作流测试
+### 2.1 Naming Convention Check
 
-按照以下顺序执行操作，模拟最常见的使用场景：
+Check each tool name and answer these questions:
 
-**测试 A：加载与浏览**
+- Does the name clearly express the tool's function?
+  For example, `capture_frame` is better than `doAction`.
+- Do the names follow a consistent style?
+  Use all snake_case or all camelCase, not a mix.
+- Are any names vague or too broad?
+  Examples: `get_data`, `process`, `run`.
+- Are there tools with similar names but different functions that could cause confusion?
+
+**Scoring criteria**:
+- ✅ All tool names are clear, consistent, and unambiguous
+- ⚠️ Most tool names are good, a few are vague
+- ❌ Naming is chaotic, and several tools are hard to tell apart
+
+### 2.2 Description Completeness Check
+
+Analyze the `description` field of each tool:
+
+- Does it explain the tool's purpose and use cases?
+- Does it explain when to use this tool (rather than another)?
+- Does it state preconditions?
+  For example, "call `load_capture` first to load the .rdc file".
+- Does it explain the meaning and format of the return value?
+- If it uses RenderDoc terminology, does it give enough context?
+
+**Test method**: Using only the tool descriptions, try to answer the questions below.
+If you can't, the descriptions are incomplete:
+
+1. "I want to see the input textures of a draw call" → which tool should I use?
+2. "I want to compare the performance of two frames" → which tool should I use?
+3. "I want to find the draw calls causing overdraw" → which tool should I use?
+
+### 2.3 Parameter Schema Check
+
+Review the `inputSchema` of each tool:
+
+- Does every parameter have an explicit `type`?
+- Are `required` and optional parameters distinguished?
+- Do enum types list all valid values?
+  Examples: shader stage, texture format.
+- Does each parameter's `description` explain the expected input?
+- Are there parameters that should have a default value but don't?
+- Do numeric parameters have reasonable range constraints (`minimum`/`maximum`)?
+
+**Pay special attention to**:
+- `event_id` / `draw_call_id` parameters: is it explained how to obtain a valid ID?
+- File path parameters: is the path format (absolute/relative) specified?
+- Coordinate/pixel parameters: are the coordinate origin and range specified?
+
+---
+
+## 3. Functional Correctness (Weight 25%)
+
+This phase requires actually calling the tools to verify they work.
+Prepare a RenderDoc capture file (.rdc) first.
+
+### 3.1 Basic Workflow Tests
+
+Run the operations in this order to simulate the most common usage:
+
+**Test A: Load and browse**
 
 ```
-步骤 1: 加载 .rdc 捕获文件
-步骤 2: 获取帧中所有 draw call / event 列表
-步骤 3: 选择一个特定的 draw call
-步骤 4: 获取该 draw call 的详细信息
+Step 1: Load the .rdc capture file
+Step 2: Get the list of all draw calls / events in the frame
+Step 3: Select a specific draw call
+Step 4: Get the details of that draw call
 ```
 
-每步检查：
-- 调用是否成功返回？
-- 返回的数据是否完整且格式正确？
-- 返回的 ID/引用是否可以在后续步骤中使用？
+Check at each step:
+- Does the call return successfully?
+- Is the returned data complete and correctly formatted?
+- Can the returned IDs/references be used in later steps?
 
-**测试 B：Shader 分析**
-
-```
-步骤 1: 获取某个 draw call 的 shader 信息
-步骤 2: 查看 vertex shader 的源代码或反编译结果
-步骤 3: 查看 pixel/fragment shader 的源代码或反编译结果
-步骤 4: 获取 shader 的输入/输出绑定信息
-```
-
-**测试 C：纹理与资源检查**
+**Test B: Shader analysis**
 
 ```
-步骤 1: 列出某个 draw call 绑定的所有纹理
-步骤 2: 获取某个纹理的元数据（格式、分辨率、mip 层级）
-步骤 3: 导出/查看某个纹理的内容（如支持）
-步骤 4: 查看 render target / framebuffer 的状态
+Step 1: Get the shader information of a draw call
+Step 2: View the source or decompiled output of the vertex shader
+Step 3: View the source or decompiled output of the pixel/fragment shader
+Step 4: Get the shader's input/output binding information
 ```
 
-**测试 D：Pipeline State 查询**
+**Test C: Texture and resource inspection**
 
 ```
-步骤 1: 获取某个 draw call 的完整 pipeline state
-步骤 2: 查看 blend state 设置
-步骤 3: 查看 depth/stencil state 设置
-步骤 4: 查看 rasterizer state（裁剪、多边形模式等）
+Step 1: List all textures bound to a draw call
+Step 2: Get a texture's metadata (format, resolution, mip levels)
+Step 3: Export/view a texture's contents (if supported)
+Step 4: View the state of the render target / framebuffer
 ```
 
-### 3.2 边界情况测试
+**Test D: Pipeline state queries**
 
-以下测试验证工具在非正常输入下的行为：
+```
+Step 1: Get the full pipeline state of a draw call
+Step 2: View the blend state settings
+Step 3: View the depth/stencil state settings
+Step 4: View the rasterizer state (culling, polygon mode, etc.)
+```
 
-| 测试场景 | 输入 | 期望行为 |
+### 3.2 Edge Case Tests
+
+These tests verify tool behavior on abnormal input:
+
+| Scenario | Input | Expected behavior |
 |---------|------|---------|
-| 无效 event ID | `event_id: 999999` | 返回清晰的 "event not found" 错误 |
-| 未加载捕获时查询 | 在未调用 `load_capture` 前查询 draw call | 返回 "no capture loaded" 错误 |
-| 空参数 | 缺少 required 参数 | 返回参数校验错误，指明缺少哪个参数 |
-| 类型错误 | `event_id: "abc"` | 返回类型校验错误 |
-| 超出范围的像素坐标 | `x: -1, y: -1` 或超出纹理尺寸 | 返回范围错误 |
-| 不支持的文件格式 | 加载非 .rdc 文件 | 返回格式不支持错误 |
+| Invalid event ID | `event_id: 999999` | Returns a clear "event not found" error |
+| Query with no capture loaded | Query a draw call before calling `load_capture` | Returns a "no capture loaded" error |
+| Empty parameters | Missing a required parameter | Returns a validation error naming the missing parameter |
+| Wrong type | `event_id: "abc"` | Returns a type validation error |
+| Out-of-range pixel coordinates | `x: -1, y: -1` or beyond the texture size | Returns a range error |
+| Unsupported file format | Load a non-.rdc file | Returns an unsupported-format error |
 
-**评分标准**：
-- ✅ 所有边界情况返回清晰、可操作的错误信息
-- ⚠️ 部分情况下错误信息模糊或缺少细节
-- ❌ 出现崩溃、超时、或返回空内容而不是错误信息
+**Scoring criteria**:
+- ✅ All edge cases return clear, actionable error messages
+- ⚠️ Some error messages are vague or lack detail
+- ❌ Crashes, timeouts, or empty content returned instead of an error message
 
-### 3.3 错误信息质量
+### 3.3 Error Message Quality
 
-对上一步收集的所有错误信息进行评估：
+Evaluate all the error messages collected in the previous step:
 
-- 错误信息是否明确指出了问题所在？
-- 是否提示了如何修正？（如 "event_id 999999 不存在，当前帧的 event 范围是 0-1523"）
-- 是否使用了 LLM 可以理解和推理的自然语言，而非晦涩的错误码？
-- 错误返回是否使用了 MCP 协议标准的 `isError: true` 标志？
-
----
-
-## 四、LLM 交互质量评估（权重 20%）
-
-此阶段评估工具对于 LLM 作为使用者而言的友好程度。
-
-### 4.1 返回值可读性
-
-对每个工具的返回值进行分析：
-
-- 返回值是否有清晰的结构？（层次分明，关键信息突出）
-- 数值是否有单位说明？（如时间是 ms 还是 μs，尺寸是 pixel 还是 byte）
-- 枚举值是否使用了可读的字符串而非裸数字？（如 `"TRIANGLES"` 而非 `4`）
-- 返回的数据量是否适中？（既不丢失关键信息，也不会塞满上下文窗口）
-
-**特别测试**：获取一个复杂 draw call 的完整信息，检查返回的 token 量。如果单次返回超过 2000 token，考虑是否存在信息过载。
-
-### 4.2 工具链路自然性
-
-验证 LLM 能否仅凭工具描述，自然地推导出以下工作流：
-
-**场景 1：性能分析**
-> "找出帧中耗时最长的 5 个 draw call，分析它们的 shader 复杂度和纹理使用情况"
-
-请尝试仅根据工具列表和描述，规划执行步骤。评估：
-- 是否需要在不相关的工具之间来回跳转？
-- 步骤之间是否存在"信息断层"（前一个工具的输出无法直接作为后一个工具的输入）？
-
-**场景 2：渲染 Bug 排查**
-> "某个物体在画面上显示为黑色，帮我定位问题原因"
-
-合理的调查路径可能包括：
-1. 找到渲染该物体的 draw call
-2. 检查纹理是否正确绑定
-3. 检查 shader 是否有编译错误
-4. 检查 blend/depth state 是否导致了不可见
-5. 查看 render target 输出
-
-评估工具集是否能完整覆盖这条排查路径。
-
-**场景 3：移动端性能优化（与你的日常工作相关）**
-> "分析帧中的 overdraw 情况，找出可以合批的 draw call"
-
-评估：
-- 是否有工具可以获取 overdraw 相关数据？
-- 是否有工具可以分析 draw call 之间的状态切换成本？
-- 是否能获取足够的信息来判断合批可行性（材质、shader、render state 是否一致）？
-
-### 4.3 工具粒度评估
-
-- 是否存在"超级工具"做了太多事情？（一个工具接受 10+ 参数，行为根据参数完全不同）
-- 是否存在过度拆分？（查看一个 draw call 的基本信息需要调用 5 个以上工具）
-- 同一层级的工具之间是否有功能重叠？
-
-**理想粒度参考**：完成一个典型的 RenderDoc 分析任务，应该需要 3-8 次工具调用。
+- Does the message clearly identify the problem?
+- Does it suggest how to fix it?
+  For example, "event_id 999999 does not exist. The event range of the current frame is 0-1523."
+- Does it use natural language an LLM can understand and reason about, rather than cryptic error codes?
+- Does the error response use the standard MCP `isError: true` flag?
 
 ---
 
-## 五、工程质量评估（权重 15%）
+## 4. LLM Interaction Quality (Weight 20%)
 
-### 5.1 性能测试
+This phase evaluates how friendly the tools are to an LLM as the user.
 
-对以下操作记录响应时间：
+### 4.1 Return Value Readability
 
-| 操作 | 可接受时间 | 实际时间 | 结果 |
+Analyze the return value of each tool:
+
+- Is the return value clearly structured?
+  It should have a clear hierarchy, with key information standing out.
+- Do numeric values have units?
+  For example, ms or μs for time, pixels or bytes for size.
+- Do enum values use readable strings rather than bare numbers?
+  For example, `"TRIANGLES"` rather than `4`.
+- Is the amount of returned data moderate?
+  It should neither drop key information nor flood the context window.
+
+**Special test**: Get the full information of a complex draw call and check the token count of the response.
+If a single response exceeds 2000 tokens, consider whether there is information overload.
+
+### 4.2 Tool Chain Naturalness
+
+Verify that an LLM can derive the following workflows naturally from the tool descriptions alone:
+
+**Scenario 1: Performance analysis**
+> "Find the 5 slowest draw calls in the frame and analyze their shader complexity and texture usage"
+
+Try to plan the execution steps using only the tool list and descriptions.
+Evaluate:
+- Do you need to jump back and forth between unrelated tools?
+- Are there "information gaps" between steps?
+  That is, the output of one tool can't be used directly as input to the next.
+
+**Scenario 2: Rendering bug investigation**
+> "An object appears black on screen; help me find the cause"
+
+A reasonable investigation path might include:
+1. Find the draw call that renders the object
+2. Check whether the textures are bound correctly
+3. Check the shader for compile errors
+4. Check whether the blend/depth state makes it invisible
+5. View the render target output
+
+Evaluate whether the toolset fully covers this path.
+
+**Scenario 3: Mobile performance optimization (relevant to your daily work)**
+> "Analyze overdraw in the frame and find draw calls that can be batched"
+
+Evaluate:
+- Is there a tool that provides overdraw data?
+- Is there a tool that analyzes the state-switch cost between draw calls?
+- Can you get enough information to judge whether batching is feasible?
+  That means checking for the same material, shader, and render state.
+
+### 4.3 Tool Granularity
+
+- Are there "super tools" that do too much?
+  For example, one tool takes 10+ parameters and behaves completely differently depending on them.
+- Is anything split too finely?
+  For example, viewing a draw call's basic information takes 5+ tool calls.
+- Do tools at the same level overlap in function?
+
+**Ideal granularity**: A typical RenderDoc analysis task should take 3-8 tool calls.
+
+---
+
+## 5. Engineering Quality (Weight 15%)
+
+### 5.1 Performance Tests
+
+Record the response time of these operations:
+
+| Operation | Acceptable time | Actual time | Result |
 |-----|-----------|---------|------|
-| 加载 .rdc 文件 | < 10s | | |
-| 获取 event 列表 | < 2s | | |
-| 获取单个 draw call 详情 | < 1s | | |
-| 获取 shader 源码 | < 2s | | |
-| 获取纹理元数据 | < 1s | | |
-| 导出纹理图片 | < 5s | | |
+| Load an .rdc file | < 10s | | |
+| Get the event list | < 2s | | |
+| Get single draw call details | < 1s | | |
+| Get shader source | < 2s | | |
+| Get texture metadata | < 1s | | |
+| Export a texture image | < 5s | | |
 
-### 5.2 稳定性测试
+### 5.2 Stability Tests
 
-- 连续调用同一个工具 10 次，结果是否一致？
-- 快速连续调用不同工具（模拟 LLM 连续推理），是否出现超时或错误？
-- 加载大型捕获文件（> 100MB）后，工具是否仍然响应正常？
+- Call the same tool 10 times in a row.
+  Are the results consistent?
+- Call different tools in rapid succession to simulate continuous LLM reasoning.
+  Do timeouts or errors occur?
+- After loading a large capture file (> 100MB), do the tools still respond normally?
 
-### 5.3 安全性检查
+### 5.3 Security Checks
 
-- 文件路径参数是否有目录遍历防护？（如传入 `../../etc/passwd`）
-- 是否有只读限制？（MCP Server 不应该有修改或删除本地文件的能力，除非明确需要）
-- 是否限制了可访问的文件类型？
+- Do file path parameters have directory traversal protection?
+  For example, try passing `../../etc/passwd`.
+- Is the server read-only?
+  An MCP Server should not be able to modify or delete local files unless explicitly required.
+- Is the set of accessible file types restricted?
 
 ---
 
-## 六、覆盖度评估（权重 15%）
+## 6. Coverage (Weight 15%)
 
-对照 RenderDoc 的核心功能，检查 MCP Server 的覆盖情况：
+Check the MCP Server's coverage against RenderDoc's core features:
 
-### 6.1 功能覆盖矩阵
+### 6.1 Feature Coverage Matrix
 
-| RenderDoc 核心功能 | 是否有对应工具 | 工具名称 | 完成度 |
+| RenderDoc core feature | Has a corresponding tool | Tool name | Completeness |
 |-------------------|:------------:|---------|-------|
-| 加载 / 打开捕获文件 | ☐ | | |
-| 浏览 Event / Draw Call 列表 | ☐ | | |
-| 查看 Pipeline State | ☐ | | |
-| 查看 Shader（源码/反编译） | ☐ | | |
-| 查看绑定的纹理和 Buffer | ☐ | | |
-| 查看 Mesh / 顶点数据 | ☐ | | |
-| 查看 Render Target 输出 | ☐ | | |
-| 像素级调试（Pixel History） | ☐ | | |
-| Shader 调试 / 单步执行 | ☐ | | |
-| 资源使用统计 | ☐ | | |
-| API 调用追踪 | ☐ | | |
-| 性能 Timing 数据 | ☐ | | |
-| 纹理导出 | ☐ | | |
-| 捕获文件比较 | ☐ | | |
+| Load / open capture files | ☐ | | |
+| Browse Event / Draw Call list | ☐ | | |
+| View Pipeline State | ☐ | | |
+| View Shaders (source/decompiled) | ☐ | | |
+| View bound textures and Buffers | ☐ | | |
+| View Mesh / vertex data | ☐ | | |
+| View Render Target output | ☐ | | |
+| Pixel-level debugging (Pixel History) | ☐ | | |
+| Shader debugging / single-stepping | ☐ | | |
+| Resource usage statistics | ☐ | | |
+| API call tracing | ☐ | | |
+| Performance timing data | ☐ | | |
+| Texture export | ☐ | | |
+| Capture file comparison | ☐ | | |
 
-### 6.2 关键缺失分析
+### 6.2 Critical Gap Analysis
 
-列出对于典型 RenderDoc 使用场景（性能分析、Bug 排查、Shader 调试）至关重要但目前缺失的功能，并按优先级排序：
+List the features that are essential for typical RenderDoc use cases but currently missing.
+Typical use cases are performance analysis, bug investigation, and shader debugging.
+Sort them by priority:
 
 ```
-P0（阻塞核心工作流）: <缺失功能列表>
-P1（显著降低效率）:   <缺失功能列表>
-P2（锦上添花）:       <缺失功能列表>
+P0 (blocks core workflows):            <list of missing features>
+P1 (significantly reduces efficiency): <list of missing features>
+P2 (nice to have):                     <list of missing features>
 ```
 
 ---
 
-## 七、综合评估报告
+## 7. Overall Evaluation Report
 
-完成所有测试后，请生成以下格式的综合评估报告：
+After all tests are complete, produce an overall evaluation report in this format:
 
 ```markdown
-# RenderDoc MCP Server 评估报告
+# RenderDoc MCP Server Evaluation Report
 
-## 基本信息
-- Server 名称: 
-- 版本: 
-- 工具数量: 
-- 评估日期: 
+## Basic Information
+- Server name: 
+- Version: 
+- Tool count: 
+- Evaluation date: 
 
-## 总分: __/100
+## Total Score: __/100
 
-## 分项得分
+## Scores by Dimension
 
-| 评估维度 | 权重 | 得分(0-100) | 加权得分 |
+| Dimension | Weight | Score (0-100) | Weighted score |
 |---------|------|-----------|---------|
-| 工具定义质量 | 25% | | |
-| 功能正确性 | 25% | | |
-| LLM 交互质量 | 20% | | |
-| 工程质量 | 15% | | |
-| 功能覆盖度 | 15% | | |
+| Tool definition quality | 25% | | |
+| Functional correctness | 25% | | |
+| LLM interaction quality | 20% | | |
+| Engineering quality | 15% | | |
+| Feature coverage | 15% | | |
 
-## 核心发现
+## Key Findings
 
-### 做得好的方面
+### Strengths
 1. 
 2. 
 3. 
 
-### 需要改进的方面
+### Areas for Improvement
 1. 
 2. 
 3. 
 
-### 阻塞性问题（如有）
+### Blocking Issues (if any)
 1. 
 
-## 详细测试记录
-（附上每个阶段的测试结果）
+## Detailed Test Records
+(Attach the results of each phase)
 
-## 改进建议优先级
+## Improvement Priorities
 
-### 立即修复
+### Fix Immediately
 - 
 
-### 短期改进（1-2 周）
+### Short Term (1-2 Weeks)
 - 
 
-### 长期规划
+### Long Term
 - 
 ```
 
 ---
 
-## 八、使用说明
+## 8. Usage Notes
 
-### 对评估者（LLM）的指引
+### Instructions for the Evaluator (LLM)
 
-1. **按顺序执行**：从第二章开始逐章进行，不要跳过任何测试项
-2. **如实记录**：即使是小问题也要记录，不要因为"整体还行"而忽略细节
-3. **站在用户角度思考**：你既是评估者，也是这个工具的使用者。如果某个工具让你感到困惑，那就是一个问题
-4. **区分严重程度**：不是所有问题都同等重要，明确标注哪些是阻塞性的，哪些是建议性的
-5. **给出具体建议**：不要只说"描述不清晰"，要说明应该怎样改写
+1. **Run in order**: Go through the chapters starting from chapter 2.
+   Don't skip any test item.
+2. **Record honestly**: Record even small problems.
+   Don't ignore details because things are "generally fine".
+3. **Think from the user's perspective**: You are both the evaluator and a user of this tool.
+   If a tool confuses you, that is a problem.
+4. **Distinguish severity**: Not all problems are equally important.
+   Mark which are blocking and which are advisory.
+5. **Give specific suggestions**: Don't just say "the description is unclear".
+   Say how it should be rewritten.
 
-### 自定义扩展
+### Custom Extensions
 
-可以根据具体项目需求，在以下方面扩展本评估框架：
+This evaluation framework can be extended as the project requires:
 
-- 针对特定图形 API（Vulkan / DirectX / OpenGL / Metal）添加专项测试
-- 针对移动平台（如你的 FPS 手游项目）添加移动端渲染特有的检查项
-- 针对特定引擎（如 UE 4.26）的渲染管线特点添加定向测试
-- 集成自动化脚本，实现部分测试的批量执行
+- Add dedicated tests for a specific graphics API, such as Vulkan, DirectX, OpenGL, or Metal.
+- Add checks specific to mobile rendering for mobile platforms, such as your FPS mobile game project.
+- Add targeted tests for the rendering pipeline of a specific engine, such as UE 4.26.
+- Integrate automation scripts to run some tests in batch

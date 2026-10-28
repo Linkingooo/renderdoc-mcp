@@ -151,7 +151,7 @@ get_pass_timing(granularity="pass")      # Find most expensive render passes
 analyze_overdraw()                        # Fill-rate pressure estimate
 analyze_bandwidth()                       # Memory bandwidth estimate
 analyze_state_changes()                   # Batching opportunities
-diagnose_negative_values()               # Find NaN/Inf/negative color values (爆闪)
+diagnose_negative_values()               # Find NaN/Inf/negative color values (bright flashes)
 diagnose_precision_issues()              # R11G11B10, D16, SRGB mismatches
 diagnose_reflection_mismatch()           # Reflection artifact diagnosis
 diagnose_mobile_risks()                  # Comprehensive mobile GPU risk check

@@ -222,11 +222,11 @@ def register(mcp: FastMCP):
             }
             warnings = []
             if has_nan:
-                warnings.append("⚠️ 检测到 NaN 值")
+                warnings.append("⚠️ NaN values detected")
             if has_inf:
-                warnings.append("⚠️ 检测到 Inf 值")
+                warnings.append("⚠️ Inf values detected")
             if has_neg:
-                warnings.append("⚠️ 检测到负值")
+                warnings.append("⚠️ Negative values detected")
             if warnings:
                 d["warnings"] = warnings
             return d

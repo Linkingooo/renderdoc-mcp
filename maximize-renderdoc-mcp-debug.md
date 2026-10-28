@@ -1,69 +1,84 @@
-# 最大化 RenderDoc MCP 调试能力：搭配方案与集成策略
+# Maximizing RenderDoc MCP Debugging: Companion Tools and Integration Strategy
 
 ---
 
-## 核心问题：RenderDoc MCP 单独能做什么、不能做什么
+## The Core Question: What RenderDoc MCP Can and Cannot Do Alone
 
-RenderDoc 本质是一个**帧级别的快照分析器**。它能告诉你"这一帧发生了什么"，但有三个根本性的盲区：
+RenderDoc is essentially a **frame-level snapshot analyzer**.
+It can tell you "what happened in this frame".
+But it has three fundamental blind spots:
 
 ```
-RenderDoc 能做的                          RenderDoc 做不到的
+What RenderDoc can do                     What RenderDoc cannot do
 ─────────────────────                     ─────────────────────
-✅ 这一帧的 draw call 列表                ❌ 为什么引擎会发出这个 draw call
-✅ 这个像素当前的颜色值                    ❌ 这个颜色值是怎么从材质参数算出来的（引擎层面）
-✅ shader 编译后的最终代码                 ❌ shader 编译前的原始 .usf/.ush 源码
-✅ constant buffer 里的数值                ❌ 这些数值是哪个引擎模块在哪里设置的
-✅ 这一帧的 GPU 耗时                      ❌ 跨帧的性能趋势和 CPU 端瓶颈
-✅ RT 格式和像素数据                       ❌ 为什么选了这个格式（引擎配置层面）
-✅ 帧内的异常检测                          ❌ 异常是否稳定复现、在哪些设备上出现
-✅ 发现问题                               ❌ 修改代码修复问题
+✅ The draw call list for this frame      ❌ Why the engine issued this draw call
+✅ The current color value of a pixel     ❌ How that color was computed from material parameters (engine level)
+✅ The final compiled shader code         ❌ The original .usf/.ush source before compilation
+✅ Values in constant buffers             ❌ Which engine module set those values, and where
+✅ GPU time for this frame                ❌ Cross-frame performance trends and CPU-side bottlenecks
+✅ RT formats and pixel data              ❌ Why this format was chosen (engine configuration)
+✅ Anomaly detection within a frame       ❌ Whether the anomaly reproduces reliably, and on which devices
+✅ Finding problems                       ❌ Modifying code to fix them
 ```
 
-这些盲区决定了：**RenderDoc MCP 单独使用可以完成约 60-70% 的诊断工作（发现问题 + 定位到 shader / pipeline state 级别的原因），但剩下的 30-40%（理解引擎层面的 why、修复代码、验证修复）需要其他工具配合。**
+These blind spots mean that **RenderDoc MCP alone can do roughly 60-70% of the diagnostic work**.
+That work is finding the problem and locating its cause at the shader / pipeline state level.
+
+**The remaining 30-40% needs other tools.**
+It consists of:
+
+- Understanding the engine-level why
+- Fixing the code
+- Verifying the fix
 
 ---
 
-## 搭配方案总览
+## Companion Overview
 
-按优先级排序，每个搭配方案解决 RenderDoc 的一个特定盲区：
+Companions are listed in priority order.
+Each covers one specific RenderDoc blind spot:
 
 ```
-优先级    搭配的 MCP              解决的盲区                           价值
-────────────────────────────────────────────────────────────────────────────
-P0       Filesystem MCP          读写项目源码、修改 shader           闭环：从诊断到修复
-P0       Git MCP                 版本对比、提交修复                   追溯问题引入时间点
-P1       UE Editor MCP           引擎层面的材质/渲染设置查询          理解 "why"
-P1       ADB / Device MCP        设备管理、截帧触发、日志收集         多设备复现和验证
-P2       Performance Log MCP     跨帧性能数据、CPU profiling         补充 GPU-only 的视角
-P2       Knowledge Base MCP      GPU 硬件特性、已知 Bug 数据库        辅助根因推理
+Priority  Companion MCP        Blind spot covered                           Value
+─────────────────────────────────────────────────────────────────────────────────
+P0        Filesystem MCP       Read/write project source, edit shaders      Closes the loop from diagnosis to fix
+P0        Git MCP              Version comparison, committing fixes         Finds when the problem was introduced
+P1        UE Editor MCP        Engine-level material/render settings        Understanding the "why"
+P1        ADB / Device MCP     Device management, capture triggers, logs    Multi-device repro and verification
+P2        Performance Log MCP  Cross-frame performance data, CPU profiling  Adds a view beyond GPU-only
+P2        Knowledge Base MCP   GPU hardware quirks, known-bug database      Aids root-cause reasoning
 ```
 
-下面逐一详细展开。
+Each is covered in detail below.
 
 ---
 
-## P0：Filesystem MCP — 从"发现问题"到"修复问题"的闭环
+## P0 Filesystem MCP: Closing the Loop from "Finding" to "Fixing"
 
-### 为什么是 P0
+### Why P0
 
-RenderDoc MCP 最大的限制是**只读**。它能告诉你"IBL shader 第 142 行的 SH 采样产生了负值，需要加 max(0, x)"，但它不能帮你改代码。如果 Claude Code 在诊断出问题后还需要你手动去找文件、改代码，那整个流程的自动化程度就大打折扣。
+RenderDoc MCP's biggest limitation is that it is **read-only**.
+It can tell you "the SH sampling on line 142 of the IBL shader produces negative values; add max(0, x)".
+But it cannot change the code.
+If you have to find the file and edit the code by hand after Claude Code diagnoses the problem, the workflow loses much of its automation.
 
-### 实现方式
+### Implementation
 
-不需要单独开发——Claude Code 本身就有文件系统访问能力。关键是让 RenderDoc MCP 的返回值中包含足够的信息，让 Claude Code 能定位到源码文件：
+No separate development is needed, since Claude Code already has file system access.
+The key is for RenderDoc MCP return values to carry enough information for Claude Code to locate the source file:
 
 ```
-RenderDoc 返回                              Claude Code 后续动作
+RenderDoc returns                           Claude Code's next steps
 ─────────────────                           ─────────────────────
-shader: "MobileBasePass.usf", line 142      → 在项目中搜索 MobileBasePass.usf
-                                            → 定位到第 142 行
-                                            → 添加 max(0, iblDiffuse) clamp
-                                            → 提交修改
+shader: "MobileBasePass.usf", line 142      → Search the project for MobileBasePass.usf
+                                            → Go to line 142
+                                            → Add a max(0, iblDiffuse) clamp
+                                            → Commit the change
 ```
 
-### 需要 RenderDoc MCP 做的适配
+### Required RenderDoc MCP Changes
 
-在 `get_shader_source` 和 `debug_shader_at_pixel` 的返回值中，尽量保留原始文件名和行号映射：
+In the return values of `get_shader_source` and `debug_shader_at_pixel`, keep the original file name and line mapping where possible:
 
 ```json
 {
@@ -74,399 +89,424 @@ shader: "MobileBasePass.usf", line 142      → 在项目中搜索 MobileBasePas
 }
 ```
 
-> 注意：SPIR-V 反编译后的行号和原始 HLSL/GLSL 的行号不一定对得上。如果 RenderDoc 捕获时包含了 debug info（shader 编译时带 -g 或 -Od），就能拿到精确映射；否则只能靠函数名和代码模式匹配。建议在开发阶段的捕获流程中始终开启 shader debug info。
+> Note: Line numbers in decompiled SPIR-V do not necessarily match the original HLSL/GLSL.
+> If the RenderDoc capture includes debug info (shaders compiled with -g or -Od), you get an exact mapping.
+> Otherwise you can only match by function name and code pattern.
+> Always enable shader debug info in the capture flow during development.
 
-### 典型闭环流程
+### Typical Closed-Loop Flow
 
 ```
 1. [RenderDoc MCP] diagnose_negative_values()
-   → "IBL_Apply shader (MobileBasePass.usf) 第 142 行 SH 采样产生负值"
+   → "SH sampling on line 142 of the IBL_Apply shader (MobileBasePass.usf) produces negative values"
 
-2. [Filesystem] 搜索项目中的 MobileBasePassPixelShader.usf
-   → 找到 Engine/Shaders/Private/MobileBasePassPixelShader.usf
+2. [Filesystem] Search the project for MobileBasePassPixelShader.usf
+   → Finds Engine/Shaders/Private/MobileBasePassPixelShader.usf
 
-3. [Filesystem] 读取文件，定位到 SampleSH 调用处
+3. [Filesystem] Read the file and locate the SampleSH call
 
-4. [Claude Code 推理] 生成修复方案：
-   - 方案 A: SH 采样后加 max(0, result)
-   - 方案 B: 在 SH 系数预处理阶段 clamp
+4. [Claude Code reasoning] Generate fix options:
+   - Option A: add max(0, result) after SH sampling
+   - Option B: clamp during SH coefficient preprocessing
 
-5. [Filesystem] 写入修改
+5. [Filesystem] Write the change
 
-6. [Git MCP] 提交到 fix/ibl-negative-clamp 分支
+6. [Git MCP] Commit to the fix/ibl-negative-clamp branch
 ```
 
 ---
 
-## P0：Git MCP — 追溯问题引入时间 + 管理修复
+## P0 Git MCP: Tracing When a Problem Was Introduced and Managing Fixes
 
-### 为什么是 P0
+### Why P0
 
-渲染 Bug 排查中一个极其常见的需求是：**"这个 Bug 是什么时候引入的？"** 比如"上周这个倒影还是正常的，这周突然偏暗了"。这需要对比不同版本的 shader 代码和渲染配置。
+A very common question when chasing rendering bugs is: **"When was this bug introduced?"**
+For example, "the reflection was fine last week, and this week it is suddenly darker".
+Answering it means comparing shader code and rendering configuration across versions.
 
-### 关键工具
+### Key Tools
 
 ```json
 {
   "name": "git_log_file",
-  "description": "查看指定文件的修改历史"
+  "description": "View the change history of a given file"
 },
 {
   "name": "git_diff",
-  "description": "对比两个 commit 之间的文件差异"
+  "description": "Compare file differences between two commits"
 },
 {
   "name": "git_blame",
-  "description": "查看文件每一行最后的修改者和时间"
+  "description": "View who last changed each line of a file, and when"
 },
 {
   "name": "git_commit",
-  "description": "提交修改到版本控制"
+  "description": "Commit changes to version control"
 },
 {
   "name": "git_branch",
-  "description": "创建/切换分支"
+  "description": "Create/switch branches"
 }
 ```
 
-### 典型流程
+### Typical Flow
 
 ```
 1. [RenderDoc MCP] diagnose_reflection_mismatch()
-   → "反射 pass 使用了 REFLECTION=1 变体，该变体缺少 IBL specular"
+   → "The reflection pass uses the REFLECTION=1 variant, which lacks IBL specular"
 
 2. [Git MCP] git_log_file("MobileBasePassPixelShader.usf")
-   → 发现 3 天前有一次修改："优化：反射 pass 移除 IBL specular 以提升性能"
+   → Finds a change from 3 days ago: "Optimization: remove IBL specular from reflection pass to improve performance"
 
 3. [Git MCP] git_diff(commit_before, commit_after, file="MobileBasePassPixelShader.usf")
-   → 确认是哪行代码被删了
+   → Confirms which lines were deleted
 
-4. [Claude Code 推理] 
-   → "3 天前的性能优化移除了反射 pass 的 IBL specular，导致反射亮度降低约 15%。
-      建议：不要完全移除，改用简化版 IBL specular（如只用 mip 最高层 cubemap 采样）"
+4. [Claude Code reasoning]
+   → "The performance optimization 3 days ago removed IBL specular from the reflection pass, lowering reflection brightness by about 15%.
+      Suggestion: don't remove it entirely; use a simplified IBL specular instead (e.g., sample only the highest mip of the cubemap)"
 
-5. [Filesystem] 写入修改
-6. [Git MCP] 提交到 fix/reflection-brightness 分支
+5. [Filesystem] Write the change
+6. [Git MCP] Commit to the fix/reflection-brightness branch
 ```
 
 ---
 
-## P1：UE Editor MCP — 理解引擎层面的"为什么"
+## P1 UE Editor MCP: Understanding the Engine-Level "Why"
 
-### 为什么是 P1
+### Why P1
 
-RenderDoc 看到的是 GPU 最终执行的指令。但很多问题的根因在引擎配置层面。举几个例子：
+RenderDoc sees the instructions the GPU finally executes.
+But the root cause of many problems lies in engine configuration.
+Some examples:
 
-| RenderDoc 看到的现象 | 引擎层面的真实原因 |
+| What RenderDoc sees | Actual engine-level cause |
 |--------------------|--------------------|
-| 反射 RT 分辨率只有主 RT 的 1/4 | SceneCapture 组件的分辨率缩放参数设成了 0.25 |
-| shader 变体 REFLECTION=1 缺少 IBL | 材质的 "Used with Planar Reflection" 开关触发了不同的编译路径 |
-| R11G11B10_FLOAT 而非 R16F | 项目的 Mobile HDR 设置选了 "Mosaic" 编码模式 |
-| 某个 post-process 意外启用 | PostProcessVolume 的 blend 权重设置问题 |
-| TAA 的 feedback 权重异常高 | 项目设置中 TAA 的自定义参数被错误修改 |
+| The reflection RT resolution is only 1/4 of the main RT | The SceneCapture component's resolution scale was set to 0.25 |
+| The REFLECTION=1 shader variant lacks IBL | The material's "Used with Planar Reflection" switch triggers a different compile path |
+| R11G11B10_FLOAT instead of R16F | The project's Mobile HDR setting uses the "Mosaic" encoding mode |
+| A post-process effect is unexpectedly enabled | A PostProcessVolume blend weight problem |
+| Abnormally high TAA feedback weight | Custom TAA parameters were changed by mistake in project settings |
 
-没有 UE Editor MCP，Claude Code 只能猜测引擎层面的原因。有了它，就能直接查证。
+Without a UE Editor MCP, Claude Code can only guess at engine-level causes.
+With one, it can check directly.
 
-### 关键工具
+### Key Tools
 
 ```json
 {
   "name": "query_material",
-  "description": "查询材质实例的参数值、shader 编译配置、使用的 feature flags"
+  "description": "Query a material instance's parameter values, shader compile configuration, and feature flags in use"
 },
 {
   "name": "query_render_settings",
-  "description": "查询项目的渲染设置：Mobile HDR 模式、TAA 参数、shadow 配置等"
+  "description": "Query the project's render settings: Mobile HDR mode, TAA parameters, shadow configuration, etc."
 },
 {
   "name": "query_scene_component",
-  "description": "查询场景中特定组件（SceneCapture、PostProcessVolume、Light）的参数"
+  "description": "Query parameters of specific scene components (SceneCapture, PostProcessVolume, Light)"
 },
 {
   "name": "query_console_variables",
-  "description": "查询引擎的 console variable 值（r.MobileHDR、r.Tonemapper 等）"
+  "description": "Query engine console variable values (r.MobileHDR, r.Tonemapper, etc.)"
 },
 {
   "name": "list_shader_permutations",
-  "description": "列出某个材质编译出的所有 shader 变体及其触发条件"
+  "description": "List all shader variants compiled for a material and their trigger conditions"
 }
 ```
 
-### 典型流程（倒影偏暗的完整排查）
+### Typical Flow (Full Investigation of a Dark Reflection)
 
 ```
 1. [RenderDoc MCP] diagnose_reflection_mismatch()
-   → "反射 pass shader 变体 REFLECTION=1 缺少 IBL specular，blend 用了 SrcAlpha"
-   → "反射 RT 分辨率是主 RT 的 1/4"
+   → "The reflection pass shader variant REFLECTION=1 lacks IBL specular, and blending uses SrcAlpha"
+   → "The reflection RT resolution is 1/4 of the main RT"
 
 2. [UE Editor MCP] query_scene_component("PlanarReflection_01")
-   → 确认 ScreenPercentage=25（这是 1/4 的来源）
+   → Confirms ScreenPercentage=25 (the source of the 1/4)
 
 3. [UE Editor MCP] query_material("M_Building_01")
-   → 确认材质开启了 "Used with Planar Reflection"
-   → 查看是否有自定义的反射亮度补偿参数
+   → Confirms the material enables "Used with Planar Reflection"
+   → Checks for a custom reflection brightness compensation parameter
 
 4. [UE Editor MCP] list_shader_permutations("M_Building_01")
-   → 对比 REFLECTION=0 和 REFLECTION=1 变体的编译选项差异
-   → 确认 REFLECTION=1 确实移除了 IBL specular
+   → Compares compile option differences between the REFLECTION=0 and REFLECTION=1 variants
+   → Confirms REFLECTION=1 does remove IBL specular
 
-5. [Claude Code 推理] 综合 RenderDoc 帧数据 + 引擎配置：
-   → "问题来自两方面叠加：
-      a) shader REFLECTION=1 变体移除了 IBL specular（-15% 亮度）
-      b) PlanarReflection blend 使用 SrcAlpha 且 alpha=0.85（再 -15%）
-      总计 -28% 亮度，与实测吻合。"
+5. [Claude Code reasoning] Combine RenderDoc frame data with engine configuration:
+   → "The problem has two compounding causes:
+      a) The shader's REFLECTION=1 variant removes IBL specular (-15% brightness)
+      b) PlanarReflection blend uses SrcAlpha with alpha=0.85 (another -15%)
+      Total -28% brightness, matching the measurement."
 
-6. [Filesystem] 修改 shader 的 REFLECTION 分支，保留简化版 IBL
-7. [UE Editor MCP] 修改 PlanarReflection 的 blend 参数（如果需要）
-8. [Git MCP] 提交修复
+6. [Filesystem] Edit the shader's REFLECTION branch to keep a simplified IBL
+7. [UE Editor MCP] Change the PlanarReflection blend parameters (if needed)
+8. [Git MCP] Commit the fix
 ```
 
-### 暂时没有 UE Editor MCP 时的替代方案
+### Alternative When No UE Editor MCP Is Available
 
-如果 UE Editor MCP 还没实现，Claude Code 可以通过 Filesystem 直接读取配置文件来获取部分信息：
+If the UE Editor MCP is not implemented yet, Claude Code can still get some of this information.
+It reads config files directly through Filesystem:
 
 ```
-- 项目渲染设置  → Config/DefaultEngine.ini 中的 [/Script/Engine.RendererSettings]
-- Console 变量  → Config/DefaultEngine.ini 或 DefaultDeviceProfiles.ini
-- 材质信息      → 需要解析 .uasset（二进制格式，较难直接读取）
+- Project render settings  → [/Script/Engine.RendererSettings] in Config/DefaultEngine.ini
+- Console variables        → Config/DefaultEngine.ini or DefaultDeviceProfiles.ini
+- Material information     → Requires parsing .uasset (binary format, hard to read directly)
 ```
 
-这种方式能覆盖约 50% 的引擎配置查询需求，材质和场景组件的查询需要等 UE Editor MCP。
+This covers about 50% of engine configuration queries.
+Material and scene component queries have to wait for the UE Editor MCP.
 
 ---
 
-## P1：ADB / Device MCP — 多设备复现和验证
+## P1 ADB / Device MCP: Multi-Device Repro and Verification
 
-### 为什么是 P1
+### Why P1
 
-移动端渲染 Bug 的一个核心难点是**设备差异性**。同一个帧在 Adreno 上爆闪、在 Mali 上正常，或者在某个驱动版本上才复现。需要能：
+A core difficulty with mobile rendering bugs is **device variance**.
+The same frame can behave differently across devices:
 
-1. 在多台设备上触发截帧
-2. 收集不同设备的 GPU 日志和错误信息
-3. 修复后在目标设备上验证
+- It shows bright flashes on Adreno.
+- It looks fine on Mali.
+- It reproduces only on a particular driver version.
 
-### 关键工具
+You need to be able to:
+
+1. Trigger captures on multiple devices
+2. Collect GPU logs and error information from different devices
+3. Verify the fix on the target device
+
+### Key Tools
 
 ```json
 {
   "name": "adb_list_devices",
-  "description": "列出所有已连接的 Android 设备及其 GPU 信息"
+  "description": "List all connected Android devices and their GPU information"
 },
 {
   "name": "adb_capture_frame",
-  "description": "在指定设备上触发 RenderDoc 截帧，返回 .rdc 文件路径"
+  "description": "Trigger a RenderDoc capture on the specified device and return the .rdc file path"
 },
 {
   "name": "adb_pull_file",
-  "description": "从设备上拉取文件（截帧、日志等）"
+  "description": "Pull files from the device (captures, logs, etc.)"
 },
 {
   "name": "adb_logcat",
-  "description": "获取设备 logcat 输出，可按 tag 过滤（如 Vulkan validation layer 日志）"
+  "description": "Get device logcat output, filterable by tag (e.g., Vulkan validation layer logs)"
 },
 {
   "name": "adb_gpu_info",
-  "description": "获取设备的 GPU 型号、驱动版本、支持的扩展列表"
+  "description": "Get the device's GPU model, driver version, and supported extension list"
 }
 ```
 
-### 典型流程（跨设备爆闪排查）
+### Typical Flow (Cross-Device Bright-Flash Investigation)
 
 ```
 1. [ADB MCP] adb_list_devices()
-   → 设备 A: Adreno 640 (已知爆闪)
-   → 设备 B: Mali-G78 (正常)
+   → Device A: Adreno 640 (known bright flashes)
+   → Device B: Mali-G78 (normal)
 
 2. [ADB MCP] adb_capture_frame(device="A") → frame_adreno.rdc
    [ADB MCP] adb_capture_frame(device="B") → frame_mali.rdc
 
 3. [RenderDoc MCP] load_capture("frame_adreno.rdc")
    [RenderDoc MCP] diagnose_negative_values()
-   → Adreno 上 SceneColor 有 47 个负值像素
+   → SceneColor has 47 negative-value pixels on Adreno
 
 4. [RenderDoc MCP] load_capture("frame_mali.rdc")
    [RenderDoc MCP] diagnose_negative_values()
-   → Mali 上 SceneColor 有 0 个负值像素
+   → SceneColor has 0 negative-value pixels on Mali
 
-5. [Claude Code 推理]
-   → "负值只在 Adreno 上出现，说明这不是 shader 逻辑错误，
-      而是 Adreno 的 mediump 精度导致 SH 采样在边界法线方向产生了负值。
-      Mali 的 mediump 精度更高所以没有触发。"
-   → "修复方案：在 SH 采样后加 max(0, x) clamp（两个平台都加，defensive coding）"
+5. [Claude Code reasoning]
+   → "Negative values appear only on Adreno, so this is not a shader logic error.
+      Adreno's mediump precision causes SH sampling to produce negative values at edge normal directions.
+      Mali's mediump has higher precision, so it doesn't trigger."
+   → "Fix: add a max(0, x) clamp after SH sampling (on both platforms, as defensive coding)"
 
-6. [Filesystem] 修改 shader
-7. [ADB MCP] 部署到设备 A 上验证
+6. [Filesystem] Edit the shader
+7. [ADB MCP] Deploy to device A to verify
 ```
 
 ---
 
-## P2：Performance Log MCP — 补充跨帧 + CPU 视角
+## P2 Performance Log MCP: Adding Cross-Frame and CPU Views
 
-### 解决什么问题
+### What It Solves
 
-RenderDoc 只能看一帧。但有些性能问题是跨帧的：
+RenderDoc sees only one frame.
+But some performance problems span frames:
 
-- TAA 的负值累积需要多帧才能观察到扩散
-- 帧率波动可能是 CPU 端 Game Thread 卡顿引起的
-- GPU 发热降频导致的渐进式性能下降
+- TAA negative-value accumulation shows its spread only over multiple frames
+- Frame rate fluctuation may come from Game Thread stalls on the CPU side
+- Progressive slowdown caused by GPU thermal throttling
 
-### 关键工具
+### Key Tools
 
 ```json
 {
   "name": "read_stat_log",
-  "description": "读取 UE 的 stat 日志文件（stat unit / stat gpu 的输出）"
+  "description": "Read UE stat log files (output of stat unit / stat gpu)"
 },
 {
   "name": "read_csv_profile",
-  "description": "读取 CSV 格式的性能 profiling 数据（如 UE 的 CSV profiler 输出）"
+  "description": "Read CSV-format performance profiling data (such as UE's CSV profiler output)"
 },
 {
   "name": "analyze_frame_time_series",
-  "description": "分析帧时间序列数据，检测卡顿 spike、渐进式降速、周期性波动"
+  "description": "Analyze frame time series data to detect hitch spikes, progressive slowdown, and periodic fluctuation"
 }
 ```
 
 ---
 
-## P2：Knowledge Base MCP — GPU 硬件知识库
+## P2 Knowledge Base MCP: GPU Hardware Knowledge Base
 
-### 解决什么问题
+### What It Solves
 
-RenderDoc MCP 的 `get_capture_info` 可以返回 GPU 型号，但 Claude Code 需要知道这个 GPU 有什么已知问题。比如：
+RenderDoc MCP's `get_capture_info` can return the GPU model.
+But Claude Code needs to know what known problems that GPU has.
+For example:
 
-- Adreno 5xx 系列的 `texelFetch` 在某些 buffer 格式下返回错误值
-- Mali T8xx 的 `imageStore` 在 R11G11B10_FLOAT 上有未定义行为
-- PowerVR 的 framebuffer fetch 在 MRT 模式下性能严重下降
+- On Adreno 5xx series, `texelFetch` returns wrong values with certain buffer formats
+- On Mali T8xx, `imageStore` has undefined behavior on R11G11B10_FLOAT
+- On PowerVR, framebuffer fetch performance drops severely in MRT mode
 
-### 实现方式
+### Implementation
 
-不一定需要独立 MCP。可以作为一个**知识文件**集成到 Claude Code 的上下文中：
+A standalone MCP is not necessarily required.
+It can be integrated into Claude Code's context as a **knowledge file**:
 
 ```
 /project/.claude/gpu-known-issues.md
 
-# Adreno 已知问题
+# Adreno Known Issues
 ## Adreno 640 (Vulkan)
-- mediump float 精度：实际为 FP16 最低要求，SH 采样边界情况可能产生负值
-- R11G11B10_FLOAT：负值 clamp 到 0（非未定义行为，但不同于桌面端的 saturate）
+- mediump float precision: actually the FP16 minimum requirement; SH sampling edge cases may produce negative values
+- R11G11B10_FLOAT: negative values clamp to 0 (not undefined behavior, but different from desktop saturate)
 - ...
 
-# Mali 已知问题
+# Mali Known Issues
 ## Mali-G78
 - ...
 ```
 
-或者更好的方式：在 `get_capture_info` 的 `known_gpu_quirks` 字段中直接内嵌，不需要额外工具。
+A better option is to embed it directly in the `known_gpu_quirks` field of `get_capture_info`.
+This needs no extra tool.
 
 ---
 
-## 最大化 RenderDoc MCP 调试能力的策略
+## Strategies for Maximizing RenderDoc MCP Debugging
 
-除了搭配其他 MCP，还有一些策略可以显著提升 RenderDoc MCP 自身的效果。
+Besides pairing it with other MCPs, a few strategies can significantly improve RenderDoc MCP's own effectiveness.
 
-### 策略 1：优化截帧质量
+### Strategy 1: Improve Capture Quality
 
-截帧的质量直接决定 RenderDoc MCP 能分析出多少信息。
+Capture quality directly determines how much information RenderDoc MCP can extract.
 
 ```
-截帧配置建议：
+Capture configuration recommendations:
 ───────────────────────────────────────────────────────────
-✅ 编译 shader 时保留 debug info（-g 或 -Od）
-   → debug_shader_at_pixel 能拿到精确的行号和变量名映射
-   → get_shader_source 返回的代码更接近原始源码
+✅ Keep debug info when compiling shaders (-g or -Od)
+   → debug_shader_at_pixel gets exact line number and variable name mappings
+   → get_shader_source returns code closer to the original source
 
-✅ 开启 Vulkan Validation Layer 后截帧
-   → 部分验证信息会被包含在捕获中
+✅ Capture with the Vulkan Validation Layer enabled
+   → Some validation information is included in the capture
 
-✅ 给 draw call 和 pass 加 debug marker / label
-   → list_events 返回的名称更可读（"SM_Rock_01" 比 "DrawIndexed(3456)" 有用得多）
-   → UE 默认会加一些 marker，但自定义的更好
+✅ Add debug markers / labels to draw calls and passes
+   → Names returned by list_events are more readable ("SM_Rock_01" is far more useful than "DrawIndexed(3456)")
+   → UE adds some markers by default, but custom ones are better
 
-✅ 截"有问题的帧"和"正常的帧"各一帧
-   → compare_pipeline_state 可以做帧间对比
-   → 如果 Bug 是间歇性的，需要等到复现时截帧
+✅ Capture one "problem frame" and one "normal frame"
+   → compare_pipeline_state can compare across frames
+   → If the bug is intermittent, wait until it reproduces before capturing
 
-❌ 不要在 Release 配置下截帧做 shader 调试
-   → Release 的 shader 优化会改变代码结构，debug 信息丢失
-   → 用 Development 或 Debug 配置截帧
+❌ Don't capture in a Release configuration for shader debugging
+   → Release shader optimization changes code structure and loses debug info
+   → Capture with a Development or Debug configuration
 ```
 
-### 策略 2：构建标准化的诊断 Prompt
+### Strategy 2: Build Standardized Diagnostic Prompts
 
-为常见 Bug 类型预设诊断 Prompt，让 Claude Code 自动执行完整的诊断链路：
+Preset diagnostic prompts for common bug types let Claude Code run the full diagnostic chain automatically:
 
 ```markdown
-## 标准诊断流程 Prompt
+## Standard Diagnostic Flow Prompts
 
-### 爆闪排查
-"加载 {rdc_path}，执行以下诊断：
-1. get_capture_info 确认设备
-2. diagnose_negative_values 扫描全帧
-3. 对每个检测到负值的 RT，用 sample_pixel_region 定位爆闪区域
-4. 对爆闪最严重的像素，执行 pixel_history 和 debug_shader_at_pixel
-5. diagnose_precision_issues 检查格式限制
-6. 综合以上信息给出根因和修复方案"
+### Bright-Flash Investigation
+"Load {rdc_path} and run the following diagnostics:
+1. get_capture_info to confirm the device
+2. diagnose_negative_values to scan the whole frame
+3. For each RT with detected negative values, use sample_pixel_region to locate the bright-flash region
+4. For the pixels with the worst bright flashes, run pixel_history and debug_shader_at_pixel
+5. diagnose_precision_issues to check format limits
+6. Combine the above to give the root cause and a fix"
 
-### 倒影 / 反射问题
-"加载 {rdc_path}，执行以下诊断：
-1. diagnose_reflection_mismatch 做初步对比
-2. 对差异最大的物体，compare_pipeline_state 对比 state
-3. get_shader_source 对比两个变体的代码差异
-4. 如果差异在常量值，用 get_shader_constants 对比
-5. 给出具体的修复方案和亮度影响预估"
+### Reflection Problems
+"Load {rdc_path} and run the following diagnostics:
+1. diagnose_reflection_mismatch for an initial comparison
+2. For the objects with the largest differences, compare state with compare_pipeline_state
+3. get_shader_source to compare code differences between the two variants
+4. If the difference is in constant values, compare with get_shader_constants
+5. Give a concrete fix and an estimate of the brightness impact"
 
-### 性能优化
-"加载 {rdc_path}，执行以下诊断：
-1. get_capture_info 确认设备
-2. get_pass_timing 找最耗时的 pass
-3. analyze_overdraw 检查 fill rate
-4. analyze_bandwidth 检查带宽
-5. analyze_state_changes 检查合批机会
+### Performance Optimization
+"Load {rdc_path} and run the following diagnostics:
+1. get_capture_info to confirm the device
+2. get_pass_timing to find the most expensive pass
+3. analyze_overdraw to check fill rate
+4. analyze_bandwidth to check bandwidth
+5. analyze_state_changes to check batching opportunities
 6. diagnose_mobile_risks(categories=['performance'])
-7. 按 ROI（优化收益/实现难度）排序给出优化建议"
+7. Give optimization suggestions sorted by ROI (optimization gain / implementation difficulty)"
 ```
 
-### 策略 3：建立对比分析的工作流
+### Strategy 3: Build a Comparative Analysis Workflow
 
-很多渲染 Bug 的诊断本质上是**对比**：
+Much rendering bug diagnosis is essentially **comparison**:
 
 ```
-对比维度              用途                           RenderDoc MCP 支持
-──────────────────────────────────────────────────────────────────
-帧内对比              正常 DC vs 反射 DC             compare_pipeline_state
-                                                    diagnose_reflection_mismatch
+Comparison dimension  Purpose                                RenderDoc MCP support
+─────────────────────────────────────────────────────────────────────────────────────
+Within a frame        Normal DC vs reflection DC             compare_pipeline_state
+                                                             diagnose_reflection_mismatch
 
-帧间对比              正常帧 vs 爆闪帧               load_capture 切换两个 .rdc
-                                                    然后用相同工具分析
+Across frames         Normal frame vs bright-flash frame     load_capture to switch between two .rdc files
+                                                             then analyze with the same tools
 
-设备间对比            Adreno 帧 vs Mali 帧           同上（配合 ADB MCP 截帧）
+Across devices        Adreno frame vs Mali frame             Same as above (capture via ADB MCP)
 
-版本间对比            修改前 vs 修改后               配合 Git MCP 定位代码变更
+Across versions       Before vs after a change               Use Git MCP to locate code changes
 
-Pass 间对比           BasePass 输出 vs PostProcess 输出  pixel_history 追踪完整链路
+Across passes         BasePass output vs PostProcess output  pixel_history traces the full chain
 ```
 
-建议在截帧流程中养成习惯：**每次截帧都同时保存一个"已知正常"的参考帧**。这样 Claude Code 在诊断时可以做帧间对比。
+Make it a habit in the capture flow: **save a "known good" reference frame with every capture**.
+Then Claude Code can compare across frames during diagnosis.
 
-### 策略 4：让智能诊断工具可扩展
+### Strategy 4: Make the Smart Diagnostic Tools Extensible
 
-模块 8（智能诊断）的 4 个工具覆盖了你提到的场景，但实际工作中一定会遇到新的 Bug 类型。建议设计一个**通用诊断脚本框架**：
+The 4 tools in Module 8 (smart diagnostics) cover the scenarios you mentioned.
+But you will certainly run into new bug types in practice.
+Design a **generic diagnostic script framework**:
 
 ```json
 {
   "name": "run_custom_diagnostic",
-  "description": "执行一段自定义的诊断脚本。脚本可以调用所有底层工具的能力。用于快速添加新的诊断逻辑而不需要修改 MCP Server 代码。",
+  "description": "Run a custom diagnostic script. The script can call all the underlying tools. Used to add new diagnostic logic quickly without modifying the MCP Server code.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "script_path": {
         "type": "string",
-        "description": "Python 诊断脚本的路径，脚本中可以调用 RenderDoc ReplayController 的所有 API"
+        "description": "Path to a Python diagnostic script, which can call all of the RenderDoc ReplayController APIs"
       },
       "params": {
         "type": "object",
-        "description": "传递给脚本的参数"
+        "description": "Parameters passed to the script"
       }
     },
     "required": ["script_path"]
@@ -474,93 +514,98 @@ Pass 间对比           BasePass 输出 vs PostProcess 输出  pixel_history �
 }
 ```
 
-这样当你遇到新类型的 Bug（比如某天需要诊断"某个 compute shader 的 SSBO 输出错误"），Claude Code 可以直接写一个诊断脚本并执行，不需要等 MCP Server 更新。
+This helps when you hit a new bug type.
+For example, one day you need to diagnose "wrong SSBO output from a compute shader".
+Claude Code can write and run a diagnostic script directly.
+It does not need to wait for an MCP Server update.
 
 ---
 
-## 推荐的实施路径
+## Recommended Rollout Path
 
 ```
-阶段 1（1-2 周）：最小可用
+Phase 1 (1-2 weeks): Minimum viable
 ────────────────────────
-RenderDoc MCP P0 工具（9 个基础工具）
-+ Claude Code 自带的 Filesystem 能力
-→ 能完成：基本的帧浏览、shader 查看、像素诊断、简单修复
+RenderDoc MCP P0 tools (9 basic tools)
++ Claude Code's built-in Filesystem capability
+→ Can do: basic frame browsing, shader viewing, pixel diagnosis, simple fixes
 
-阶段 2（2-4 周）：核心场景覆盖
+Phase 2 (2-4 weeks): Core scenario coverage
 ────────────────────────
-RenderDoc MCP P1 工具（+6 个高价值工具）
-+ Git 集成（Claude Code 直接用 git CLI）
-→ 能完成：爆闪诊断、负值追溯、反射对比、性能分析、代码修复+提交
+RenderDoc MCP P1 tools (+6 high-value tools)
++ Git integration (Claude Code uses the git CLI directly)
+→ Can do: bright-flash diagnosis, negative-value tracing, reflection comparison, performance analysis, code fix + commit
 
-阶段 3（1-2 月）：完整体系
+Phase 3 (1-2 months): Complete system
 ────────────────────────
-RenderDoc MCP P2 工具（+7 个增强工具）
-+ UE Editor MCP（如果需要引擎层面的查询）
-+ ADB 集成（用于多设备测试）
-→ 能完成：全自动化的端到端诊断、跨设备对比、移动端风险预检
+RenderDoc MCP P2 tools (+7 enhancement tools)
++ UE Editor MCP (if engine-level queries are needed)
++ ADB integration (for multi-device testing)
+→ Can do: fully automated end-to-end diagnosis, cross-device comparison, mobile risk pre-checks
 
-阶段 4（持续迭代）：智能化
+Phase 4 (ongoing iteration): Intelligence
 ────────────────────────
-积累诊断案例 → 沉淀为标准化 Prompt 和自定义诊断脚本
-不断扩充 GPU 已知问题知识库
-根据实际使用中的痛点添加新的智能诊断工具
-```
-
----
-
-## 各场景下的完整工具链
-
-### 场景：倒影偏暗（完整闭环）
-
-```
-[RenderDoc MCP]  diagnose_reflection_mismatch    → 定位差异
-[RenderDoc MCP]  debug_shader_at_pixel           → 确认 shader 级别的原因
-[Filesystem]     读取 MobileBasePassPixelShader.usf  → 找到源码
-[Git]            git blame 该文件                  → 确认最近谁改了反射分支
-[Filesystem]     修改 shader 代码                  → 修复
-[Git]            提交到 fix 分支                   → 版本管理
-[ADB] (可选)     在目标设备上截帧验证               → 确认修复有效
-```
-
-### 场景：TAA 爆闪（完整闭环）
-
-```
-[ADB] (可选)     在爆闪设备上截帧                   → 获取 .rdc
-[RenderDoc MCP]  get_capture_info                  → 确认 GPU 型号
-[RenderDoc MCP]  diagnose_negative_values           → 定位负值源头和 TAA 放大
-[RenderDoc MCP]  debug_shader_at_pixel              → 追踪 TAA shader 执行过程
-[RenderDoc MCP]  diagnose_precision_issues           → 确认 R11G11B10 格式限制
-[Filesystem]     读取 TAA shader 和 IBL shader       → 找到需要修改的代码
-[Filesystem]     修改：IBL clamp + TAA history clamp  → 双重修复
-[Git]            提交修复                            → 版本管理
-[ADB] (可选)     多设备验证                          → 确认不同 GPU 都正常
-```
-
-### 场景：性能优化（完整闭环）
-
-```
-[RenderDoc MCP]  get_pass_timing                   → 找瓶颈 pass
-[RenderDoc MCP]  analyze_overdraw                   → 找 fill rate 热点
-[RenderDoc MCP]  analyze_bandwidth                  → 找带宽瓶颈
-[RenderDoc MCP]  analyze_state_changes              → 找合批机会
-[RenderDoc MCP]  diagnose_mobile_risks              → 综合风险评估
-[Filesystem]     修改渲染代码 / 项目配置             → 实施优化
-[Git]            提交优化                            → 版本管理
-[RenderDoc MCP]  加载优化后的帧，重新分析             → 验证优化效果
+Accumulate diagnostic cases → distill them into standardized prompts and custom diagnostic scripts
+Keep expanding the GPU known-issues knowledge base
+Add new smart diagnostic tools based on pain points in real use
 ```
 
 ---
 
-## 总结
+## Full Toolchains by Scenario
 
-**RenderDoc MCP 单独就是一个强大的诊断引擎**，覆盖了帧级别分析的绝大部分需求。但要实现从"发现问题"到"修复问题"的完整闭环：
+### Scenario: Dark Reflection (Full Loop)
 
-- **必须搭配**：Filesystem（读写代码）+ Git（版本管理）— 这两个 Claude Code 已经自带
-- **强烈推荐**：UE Editor MCP（理解引擎层面的 why）+ ADB（多设备支持）
-- **锦上添花**：Performance Log（跨帧分析）+ 知识库（GPU 硬件特性）
+```
+[RenderDoc MCP]  diagnose_reflection_mismatch       → Locate the difference
+[RenderDoc MCP]  debug_shader_at_pixel              → Confirm the shader-level cause
+[Filesystem]     Read MobileBasePassPixelShader.usf → Find the source
+[Git]            git blame on that file             → See who recently changed the reflection branch
+[Filesystem]     Edit the shader code               → Fix
+[Git]            Commit to a fix branch             → Version management
+[ADB] (optional) Capture on the target device       → Confirm the fix works
+```
 
-最大化 RenderDoc MCP 效果的关键不在于搭配多少工具，而在于：
-1. **截帧质量**：shader debug info + debug marker + 保存参考帧
-2. **对比思维**：帧内对比、帧间对比、设备间对比、版本间对比
-3. **诊断沉淀**：把每次排查的经验变成标准化 Prompt 和可复用的诊断脚本
+### Scenario: TAA Bright Flashes (Full Loop)
+
+```
+[ADB] (optional) Capture on the bright-flash device  → Get the .rdc
+[RenderDoc MCP]  get_capture_info                    → Confirm the GPU model
+[RenderDoc MCP]  diagnose_negative_values            → Locate the negative-value source and TAA amplification
+[RenderDoc MCP]  debug_shader_at_pixel               → Trace the TAA shader execution
+[RenderDoc MCP]  diagnose_precision_issues           → Confirm the R11G11B10 format limit
+[Filesystem]     Read the TAA shader and IBL shader  → Find the code to change
+[Filesystem]     Edit: IBL clamp + TAA history clamp → Two-part fix
+[Git]            Commit the fix                      → Version management
+[ADB] (optional) Multi-device verification           → Confirm all GPUs are fine
+```
+
+### Scenario: Performance Optimization (Full Loop)
+
+```
+[RenderDoc MCP]  get_pass_timing                         → Find the bottleneck pass
+[RenderDoc MCP]  analyze_overdraw                        → Find fill rate hotspots
+[RenderDoc MCP]  analyze_bandwidth                       → Find bandwidth bottlenecks
+[RenderDoc MCP]  analyze_state_changes                   → Find batching opportunities
+[RenderDoc MCP]  diagnose_mobile_risks                   → Overall risk assessment
+[Filesystem]     Edit rendering code / project config    → Apply the optimization
+[Git]            Commit the optimization                 → Version management
+[RenderDoc MCP]  Load the optimized frame and re-analyze → Verify the optimization
+```
+
+---
+
+## Summary
+
+**RenderDoc MCP alone is a powerful diagnostic engine** that covers most frame-level analysis needs.
+But to close the loop from "finding the problem" to "fixing the problem":
+
+- **Required companions**: Filesystem (read/write code) + Git (version management).
+  Claude Code already has both built in.
+- **Strongly recommended**: UE Editor MCP (understanding the engine-level why) + ADB (multi-device support)
+- **Nice to have**: Performance Log (cross-frame analysis) + knowledge base (GPU hardware quirks)
+
+Getting the most out of RenderDoc MCP depends less on how many tools you pair it with than on:
+1. **Capture quality**: shader debug info + debug markers + saved reference frames
+2. **Comparative thinking**: within-frame, cross-frame, cross-device, and cross-version comparison
+3. **Distilling diagnostics**: turn the experience from each investigation into standardized prompts and reusable diagnostic scripts

@@ -194,8 +194,8 @@ def register(mcp: FastMCP):
                 if scan["negative_count"] > upstream_neg * 2 and upstream_neg > 0:
                     ratio = scan["negative_count"] / upstream_neg
                     entry["accumulation_warning"] = (
-                        f"⚠️ 负值数 ({scan['negative_count']}) 是上游首次引入值 ({upstream_neg}) 的 {ratio:.1f}x，"
-                        "疑似 TAA/temporal feedback 正在持续放大负值"
+                        f"⚠️ Negative count ({scan['negative_count']}) vs. the count where negatives first appeared upstream ({upstream_neg}) is {ratio:.1f}x; "
+                        "TAA/temporal feedback is likely amplifying negative values over time"
                     )
 
             affected.append(entry)
@@ -208,32 +208,32 @@ def register(mcp: FastMCP):
                 ename = intro.get("name", "")
                 if any(k in ename.upper() for k in ["IBL", "SH", "REFLECTION", "LIGHTING"]):
                     candidates.append({
-                        "likelihood": "高",
-                        "cause": f"IBL/SH 光照计算在 event {intro['event_id']} 产生负值",
-                        "evidence": f"负值首次出现于: {ename}",
-                        "fix": "在 SH 采样后添加 max(0, result) clamp，或使用非负 SH 基函数",
+                        "likelihood": "high",
+                        "cause": f"IBL/SH lighting computation produces negative values at event {intro['event_id']}",
+                        "evidence": f"Negative values first appear in: {ename}",
+                        "fix": "Clamp with max(0, result) after SH sampling, or use a non-negative SH basis",
                     })
                 if any(k in ename.upper() for k in ["TAA", "TEMPORAL", "HISTORY"]):
                     candidates.append({
-                        "likelihood": "高",
-                        "cause": "TAA/temporal pass 放大了上游负值",
-                        "evidence": f"TAA pass ({ename}) 中负值数量放大",
-                        "fix": "TAA shader 中对 history 采样结果和 AABB neighborhood clamp 下界设为 0",
+                        "likelihood": "high",
+                        "cause": "TAA/temporal pass amplified upstream negative values",
+                        "evidence": f"Negative count amplified in TAA pass ({ename})",
+                        "fix": "In the TAA shader, set the lower bound of the history sample and AABB neighborhood clamp to 0",
                     })
                 if entry.get("accumulation_warning"):
                     candidates.append({
-                        "likelihood": "高",
-                        "cause": "Temporal feedback 累积放大负值",
+                        "likelihood": "high",
+                        "cause": "Temporal feedback accumulation amplifies negative values",
                         "evidence": entry["accumulation_warning"],
-                        "fix": "检查 temporal weight 和 color clipping 逻辑，确保负值不进入 history buffer",
+                        "fix": "Check temporal weight and color clipping logic so negative values do not enter the history buffer",
                     })
 
         if not candidates and affected:
             candidates.append({
-                "likelihood": "中",
-                "cause": "浮点精度或算法产生意外负值",
-                "evidence": f"在 {len(affected)} 个 RT 中检测到负值",
-                "fix": "使用 debug_shader_at_pixel 在负值像素处单步追踪 shader 计算过程",
+                "likelihood": "medium",
+                "cause": "Floating-point precision or the algorithm produces unexpected negative values",
+                "evidence": f"Negative values detected in {len(affected)} RT(s)",
+                "fix": "Use debug_shader_at_pixel to step through the shader computation at a negative-value pixel",
             })
 
         status = "NEGATIVE_VALUES_DETECTED" if affected else "NO_ANOMALIES_FOUND"
@@ -242,8 +242,8 @@ def register(mcp: FastMCP):
             "affected_targets": affected,
             "root_cause_candidates": candidates,
             "summary": (
-                f"在 {len(affected)} 个浮点 RT 中检测到异常值" if affected
-                else "所有检查的浮点 RT 均未检测到负值/NaN/Inf"
+                f"Anomalous values detected in {len(affected)} float RT(s)" if affected
+                else "No negative/NaN/Inf values detected in any checked float RT"
             ),
         })
 
@@ -290,11 +290,11 @@ def register(mcp: FastMCP):
                         "severity": "high",
                         "target": f"{getattr(tex, 'name', None) or rid_str} ({fmt}) {tex.width}x{tex.height}",
                         "description": (
-                            "R11G11B10_FLOAT 没有符号位，无法存储负值。"
-                            "写入负值会被 clamp 到 0（Adreno）或产生未定义行为（Mali）。"
+                            "R11G11B10_FLOAT has no sign bit and cannot store negative values. "
+                            "Writing negative values is clamped to 0 (Adreno) or produces undefined behavior (Mali)."
                         ),
                         "affected_event_count": len(writing_events),
-                        "fix": "如上游计算可能产生负值（IBL SH、HDR tonemapping），在写入该 RT 前 clamp 到 [0, max]，或改用 R16G16B16A16_FLOAT",
+                        "fix": "If upstream computation can produce negative values (IBL SH, HDR tonemapping), clamp to [0, max] before writing this RT, or switch to R16G16B16A16_FLOAT",
                     })
 
             # Check for half-precision color targets
@@ -315,16 +315,16 @@ def register(mcp: FastMCP):
                         "type": "depth_precision",
                         "severity": "medium",
                         "target": f"{getattr(dtex, 'name', None) or str(dtex.resourceId)} (D16) {dtex.width}x{dtex.height}",
-                        "description": "D16 深度精度仅 16-bit，在远平面附近极易出现 z-fighting。",
-                        "fix": "改用 D24_UNORM_S8_UINT 或更好的 D32_SFLOAT (reversed-Z)",
+                        "description": "D16 depth has only 16-bit precision; z-fighting is very likely near the far plane.",
+                        "fix": "Use D24_UNORM_S8_UINT or, better, D32_SFLOAT (reversed-Z)",
                     })
                 elif "D24" in fmt:
                     issues.append({
                         "type": "depth_precision",
                         "severity": "low",
                         "target": f"{getattr(dtex, 'name', None) or str(dtex.resourceId)} (D24) {dtex.width}x{dtex.height}",
-                        "description": "D24 深度 buffer 在远处精度降低。large far-plane 场景建议使用 reversed-Z + D32。",
-                        "fix": "考虑 reversed-Z 技术或缩小 far plane，可将远处精度提升约 3 倍",
+                        "description": "D24 depth buffer loses precision at distance. Use reversed-Z + D32 for large far-plane scenes.",
+                        "fix": "Consider reversed-Z or a smaller far plane; this can improve distant precision about 3x",
                     })
 
         if focus in ("all", "format_risks"):
@@ -335,8 +335,8 @@ def register(mcp: FastMCP):
                 issues.append({
                     "type": "gamma_risk",
                     "severity": "low",
-                    "description": f"帧中同时存在 SRGB ({srgb_textures} 个) 和 linear UNORM ({linear_textures} 个) 纹理，注意 gamma 处理一致性",
-                    "fix": "确保 SRGB 纹理采样时自动 linearize (sampler 使用 SRGB)，避免在 linear 纹理上手动做 gamma 矫正",
+                    "description": f"Frame has both SRGB ({srgb_textures}) and linear UNORM ({linear_textures}) textures; keep gamma handling consistent",
+                    "fix": "Make sure SRGB textures are linearized automatically when sampled (sampler uses SRGB), and avoid manual gamma correction on linear textures",
                 })
 
         # Summary
@@ -347,7 +347,7 @@ def register(mcp: FastMCP):
         return to_json({
             "issues_found": len(issues),
             "issues": issues,
-            "summary": f"检测到 {len(issues)} 个精度风险（{high_count} high / {med_count} medium / {low_count} low）",
+            "summary": f"Detected {len(issues)} precision risk(s) ({high_count} high / {med_count} medium / {low_count} low)",
         })
 
     @mcp.tool()
@@ -397,8 +397,8 @@ def register(mcp: FastMCP):
         if not reflection_eids:
             return to_json({
                 "status": "NO_REFLECTION_PASS_FOUND",
-                "message": "未找到反射 pass。尝试使用 reflection_pass_hint 参数指定 pass 名称关键字。",
-                "suggestion": "使用 list_actions 查看帧结构，找到反射相关的 pass 名称",
+                "message": "No reflection pass found. Try the reflection_pass_hint parameter to specify a pass name keyword.",
+                "suggestion": "Use list_actions to inspect the frame structure and find the reflection-related pass name",
             })
 
         # Try to find paired draw calls
@@ -429,7 +429,7 @@ def register(mcp: FastMCP):
                 "status": "NO_PAIRS_FOUND",
                 "reflection_event_count": len(reflection_eids),
                 "normal_event_count": len(normal_eids),
-                "message": "找到反射 pass 但无法配对对应的正常渲染 draw call。",
+                "message": "Found the reflection pass but could not pair it with a corresponding normal-render draw call.",
             })
 
         results: list[dict] = []
@@ -473,7 +473,7 @@ def register(mcp: FastMCP):
                     "normal_rt": {"format": normal_fmt, "size": normal_size, "sample_color": [round(v, 4) for v in normal_rgba[:3]]},
                     "reflection_rt": {"format": refl_fmt, "size": refl_size, "sample_color": [round(v, 4) for v in refl_rgba[:3]]},
                     "brightness_ratio": round(ratio, 3),
-                    "description": f"反射比正常渲染{'暗' if ratio < 0.95 else '亮'} {abs(1-ratio)*100:.0f}%" if abs(1-ratio) > 0.03 else "亮度接近",
+                    "description": f"Reflection is {'darker' if ratio < 0.95 else 'brighter'} than normal rendering by {abs(1-ratio)*100:.0f}%" if abs(1-ratio) > 0.03 else "Brightness is similar",
                 }
 
             # Compare pipeline state
@@ -491,9 +491,9 @@ def register(mcp: FastMCP):
                 if n_ps and r_ps and str(n_ps.resourceId) != str(r_ps.resourceId):
                     causes.append({
                         "factor": "shader_variant",
-                        "detail": f"Pixel shader 不同: normal={n_ps.entryPoint} refl={r_ps.entryPoint}",
-                        "implication": "反射 pass 使用了不同的 shader 变体，可能跳过了部分光照计算（如 IBL specular）",
-                        "fix": "检查反射 pass shader 变体是否包含完整光照，或对比 REFLECTION=0/1 宏的代码差异",
+                        "detail": f"Pixel shader differs: normal={n_ps.entryPoint} refl={r_ps.entryPoint}",
+                        "implication": "The reflection pass uses a different shader variant and may skip some lighting computation (e.g. IBL specular)",
+                        "fix": "Check whether the reflection pass shader variant includes full lighting, or compare code differences for the REFLECTION=0/1 macro",
                     })
 
                 # Blend comparison
@@ -507,8 +507,8 @@ def register(mcp: FastMCP):
                             causes.append({
                                 "factor": "blend_state",
                                 "detail": f"Blend: normal={nb0.enabled} → reflection={rb0.enabled}",
-                                "implication": "反射 pass 的 blend 配置不同，可能导致颜色被 alpha 衰减",
-                                "fix": f"确认反射 pass 是否需要 alpha blend；如不需要应与正常渲染一致",
+                                "implication": "The reflection pass has a different blend configuration, which may attenuate color by alpha",
+                                "fix": f"Confirm whether the reflection pass needs alpha blend; if not, it should match normal rendering",
                             })
                         elif nb0.enabled and rb0.enabled:
                             ns_src = enum_str(nb0.colorBlend.source, BLEND_FACTOR_MAP, "")
@@ -517,8 +517,8 @@ def register(mcp: FastMCP):
                                 causes.append({
                                     "factor": "blend_src_factor",
                                     "detail": f"Color src factor: {ns_src} → {rs_src}",
-                                    "implication": f"Src factor 从 {ns_src} 变为 {rs_src}，可能导致亮度衰减",
-                                    "fix": f"检查反射 pass 的 blend src factor 是否需要与正常渲染一致",
+                                    "implication": f"Src factor changed from {ns_src} to {rs_src}, which may reduce brightness",
+                                    "fix": f"Check whether the reflection pass blend src factor should match normal rendering",
                                 })
                 except Exception:
                     pass
@@ -528,8 +528,8 @@ def register(mcp: FastMCP):
                     causes.append({
                         "factor": "render_target_format",
                         "detail": f"RT format: normal={normal_fmt} → reflection={refl_fmt}",
-                        "implication": "RT 格式不同可能影响精度（如 R11G11B10 vs R16G16B16A16）",
-                        "fix": "统一反射 RT 格式以避免精度损失",
+                        "implication": "Different RT formats may affect precision (e.g. R11G11B10 vs R16G16B16A16)",
+                        "fix": "Use the same RT format for the reflection pass to avoid precision loss",
                     })
 
             except Exception as e:
@@ -537,7 +537,7 @@ def register(mcp: FastMCP):
 
             entry["causes"] = causes
             if not causes:
-                entry["note"] = "未发现明显差异，建议使用 diff_draw_calls 进行深度对比"
+                entry["note"] = "No obvious differences found; use diff_draw_calls for a deeper comparison"
 
             results.append(entry)
 
@@ -545,7 +545,7 @@ def register(mcp: FastMCP):
             "reflection_pass_type": reflection_pass_hint or "auto-detected",
             "reflection_events_found": len(reflection_eids),
             "paired_objects": results,
-            "summary": f"分析了 {len(results)} 对正常/反射 draw call",
+            "summary": f"Analyzed {len(results)} normal/reflection draw call pair(s)",
         })
 
     @mcp.tool()
@@ -605,15 +605,15 @@ def register(mcp: FastMCP):
                         except Exception:
                             scan = {"negative_count": 0, "nan_count": 0}
 
-                        detail = f"{getattr(tex, 'name', None) or rid_str} 使用 R11G11B10_FLOAT（无符号位），{len(writing_events)} 个 draw call 写入该 RT。"
+                        detail = f"{getattr(tex, 'name', None) or rid_str} uses R11G11B10_FLOAT (no sign bit); {len(writing_events)} draw call(s) write this RT."
                         if scan.get("negative_count", 0) > 0:
-                            detail += f" 已确认检测到 {scan['negative_count']} 个负值样本。"
+                            detail += f" Confirmed {scan['negative_count']} negative sample(s)."
                         risks.append({
                             "category": "precision",
                             "severity": "high",
-                            "title": f"R11G11B10_FLOAT 存储负值风险: {getattr(tex, 'name', None) or rid_str}",
+                            "title": f"R11G11B10_FLOAT negative value storage risk: {getattr(tex, 'name', None) or rid_str}",
                             "detail": detail,
-                            "fix": "在写入该 RT 前 clamp 输出到 [0, +inf]，或改用 R16G16B16A16_FLOAT",
+                            "fix": "Clamp output to [0, +inf] before writing this RT, or switch to R16G16B16A16_FLOAT",
                         })
 
             # Depth precision
@@ -623,9 +623,9 @@ def register(mcp: FastMCP):
                     risks.append({
                         "category": "precision",
                         "severity": "high",
-                        "title": f"D16 深度精度不足: {getattr(tex, 'name', None) or str(tex.resourceId)}",
-                        "detail": "16-bit 深度 buffer 精度极低，近远平面比例大时 z-fighting 明显",
-                        "fix": "改用 D24_UNORM_S8_UINT 或 D32_SFLOAT + reversed-Z",
+                        "title": f"D16 depth precision insufficient: {getattr(tex, 'name', None) or str(tex.resourceId)}",
+                        "detail": "16-bit depth buffer has very low precision; z-fighting is pronounced with a large near/far plane ratio",
+                        "fix": "Use D24_UNORM_S8_UINT or D32_SFLOAT + reversed-Z",
                     })
 
         # ── Performance risks ──
@@ -658,9 +658,9 @@ def register(mcp: FastMCP):
                 risks.append({
                     "category": "performance",
                     "severity": "medium",
-                    "title": f"全屏 pass 过多: {main_clear_count} 次 clear",
-                    "detail": f"主 RT ({main_res[0]}x{main_res[1]}) 被 clear {main_clear_count} 次，说明有大量全屏 pass，每次在 tile-based GPU 上触发 tile store/load",
-                    "fix": "合并 post-process pass，减少 RT 切换次数",
+                    "title": f"Too many full-screen passes: {main_clear_count} clears",
+                    "detail": f"Main RT ({main_res[0]}x{main_res[1]}) is cleared {main_clear_count} times, indicating many full-screen passes; each triggers a tile store/load on tile-based GPUs",
+                    "fix": "Merge post-process passes to reduce RT switches",
                 })
 
             # Sampler count check
@@ -686,9 +686,9 @@ def register(mcp: FastMCP):
                 risks.append({
                     "category": "compatibility",
                     "severity": "medium",
-                    "title": f"纹理采样器绑定数偏高: {max_samplers} 个 (event {heavy_eid})",
-                    "detail": f"部分移动 GPU 限制最多 16 个采样器，当前最大绑定 {max_samplers} 个",
-                    "fix": "合并纹理 atlas 或使用纹理数组减少采样器数量",
+                    "title": f"High texture sampler binding count: {max_samplers} (event {heavy_eid})",
+                    "detail": f"Some mobile GPUs limit samplers to 16; this frame binds up to {max_samplers}",
+                    "fix": "Merge textures into an atlas or use texture arrays to reduce sampler count",
                 })
 
         # ── Compatibility risks ──
@@ -699,9 +699,9 @@ def register(mcp: FastMCP):
                     risks.append({
                         "category": "compatibility",
                         "severity": "medium",
-                        "title": f"超大纹理: {getattr(tex, 'name', None) or str(tex.resourceId)} ({tex.width}x{tex.height})",
-                        "detail": "部分移动设备最大纹理尺寸为 4096，超过此限制会导致渲染错误或黑图",
-                        "fix": "降低纹理分辨率或使用纹理流加载",
+                        "title": f"Oversized texture: {getattr(tex, 'name', None) or str(tex.resourceId)} ({tex.width}x{tex.height})",
+                        "detail": "Some mobile devices cap texture size at 4096; exceeding it causes rendering errors or black output",
+                        "fix": "Lower texture resolution or use texture streaming",
                     })
 
         # ── GPU-specific risks ──
@@ -710,17 +710,17 @@ def register(mcp: FastMCP):
                 risks.append({
                     "category": "gpu_specific",
                     "severity": "medium",
-                    "title": "Adreno: mediump float 精度低于 spec",
-                    "detail": "Adreno GPU 的 mediump 精度约为 FP16 最低要求，法线重建和反射计算可能产生可见瑕疵",
-                    "fix": "法线重建、lighting、反射方向计算使用 highp 或 full float precision",
+                    "title": "Adreno: mediump float precision below spec",
+                    "detail": "Adreno mediump precision is about the FP16 minimum; normal reconstruction and reflection computation may show visible artifacts",
+                    "fix": "Use highp or full float precision for normal reconstruction, lighting, and reflection direction computation",
                 })
             elif "MALI" in gpu_upper:
                 risks.append({
                     "category": "gpu_specific",
                     "severity": "low",
-                    "title": "Mali: discard 性能影响",
-                    "detail": "Mali GPU 使用大量 discard 会导致 early-Z 失效，增加 overdraw 开销",
-                    "fix": "减少 alpha-test 中的 discard 用法，改用 alpha-to-coverage 或 pre-Z pass",
+                    "title": "Mali: discard performance impact",
+                    "detail": "Heavy use of discard on Mali GPUs disables early-Z and increases overdraw cost",
+                    "fix": "Reduce discard in alpha-test; use alpha-to-coverage or a pre-Z pass instead",
                 })
 
         # Filter by severity
@@ -739,6 +739,6 @@ def register(mcp: FastMCP):
             "device": driver_name,
             "risks": risks,
             "risk_count": len(risks),
-            "summary": f"发现 {len(risks)} 个风险项（{high_n} high / {med_n} medium / {low_n} low）。"
-                       + (f" 最高优先级：{risks[0]['title']}" if risks else " 未检测到明显风险。"),
+            "summary": f"Found {len(risks)} risk(s) ({high_n} high / {med_n} medium / {low_n} low)."
+                       + (f" Highest priority: {risks[0]['title']}" if risks else " No significant risks detected."),
         })

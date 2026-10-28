@@ -1,54 +1,57 @@
-# RenderDoc MCP Server 工具设计方案
+# RenderDoc MCP Server Tool Design
 
-> 目标：让 Claude Code 通过 MCP 协议接入 RenderDoc，具备渲染 Bug 排查、性能分析、优化建议的完整能力。
-> 覆盖移动端 FPS 项目中常见的精度问题、爆闪、颜色偏差、TAA 负值、IBL 异常等典型场景。
+> Goal: let Claude Code connect to RenderDoc over MCP for full rendering bug triage, performance analysis, and optimization advice.
+> Covers typical scenarios in mobile FPS projects: precision issues, bright flashes, color shifts, negative TAA values, IBL anomalies.
 
 ---
 
-## 整体架构
+## Overall Architecture
 
 ```
 Claude Code
     │
     └── RenderDoc MCP Server ──── RenderDoc Python API (renderdoc / qrenderdoc module)
             │
-            ├── 1. 捕获文件管理（加载、设备信息）
-            ├── 2. Event 与 Draw Call 浏览（列表、详情、搜索）
-            ├── 3. Pipeline State 深度查询（blend/depth/raster 全状态 + 双事件对比）
-            ├── 4. Shader 分析（源码、常量、单像素调试）
-            ├── 5. 像素级诊断（Pixel History、区域扫描异常检测）
-            ├── 6. 资源检查（纹理统计/读取、Buffer 读取）
-            ├── 7. 性能分析（Pass Timing、Overdraw、带宽、状态切换）
-            └── 8. 智能诊断（负值扫描、精度检测、反射对比、移动端风险预检）
+            ├── 1. Capture file management (load, device info)
+            ├── 2. Event and draw call browsing (list, detail, search)
+            ├── 3. Deep pipeline state queries (full blend/depth/raster state + two-event comparison)
+            ├── 4. Shader analysis (source, constants, single-pixel debugging)
+            ├── 5. Pixel-level diagnosis (pixel history, region scan anomaly detection)
+            ├── 6. Resource inspection (texture stats/reads, buffer reads)
+            ├── 7. Performance analysis (pass timing, overdraw, bandwidth, state changes)
+            └── 8. Smart diagnostics (negative value scan, precision detection, reflection comparison, mobile risk pre-check)
 ```
 
-核心设计原则：
+Core design principles:
 
-- **LLM 可读性优先**：返回值包含人类可读的摘要和诊断提示，不只是裸数据
-- **内置异常检测**：工具自动标注 NaN / Inf / 负值 / 极端值，LLM 无需自己判断
-- **操作链路通畅**：每个工具的返回值中包含下一步可用的 ID 和建议操作
-- **token 预算可控**：大数据量工具提供 brief 模式和 filter 参数，避免撑爆上下文
+- **LLM readability first**: return values include human-readable summaries and diagnostic hints, not just raw data
+- **Built-in anomaly detection**: tools automatically flag NaN / Inf / negative / extreme values.
+  The LLM need not judge them itself.
+- **Clear operation chain**: each tool's return value includes the IDs and suggested actions for the next step
+- **Controlled token budget**: tools with large outputs provide a brief mode and filter parameters.
+  This avoids overflowing the context.
 
 ---
 
-## 模块 1：捕获文件管理
+## Module 1: Capture File Management
 
 ---
 
 ### 1.1 `load_capture`
 
-加载 RenderDoc 捕获文件。所有后续操作的前置步骤。
+Load a RenderDoc capture file.
+The prerequisite for all subsequent operations.
 
 ```json
 {
   "name": "load_capture",
-  "description": "加载 RenderDoc 捕获文件（.rdc）。这是所有分析操作的前置步骤，必须先加载才能查询。加载成功后返回帧的基本概览。如果之前已加载其他文件，会自动关闭旧文件。",
+  "description": "Load a RenderDoc capture file (.rdc). This is the prerequisite for all analysis operations; a capture must be loaded before it can be queried. On success, returns a basic overview of the frame. If another file was loaded earlier, it is closed automatically.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "file_path": {
         "type": "string",
-        "description": ".rdc 文件的绝对路径"
+        "description": "Absolute path to the .rdc file"
       }
     },
     "required": ["file_path"]
@@ -56,7 +59,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "status": "loaded",
@@ -66,7 +69,7 @@ Claude Code
   "total_dispatches": 47,
   "render_targets_count": 12,
   "frame_duration_ms": 16.7,
-  "summary": "Vulkan 帧，3847 个事件（1523 draw / 47 dispatch），帧时长 16.7ms"
+  "summary": "Vulkan frame, 3847 events (1523 draw / 47 dispatch), frame duration 16.7ms"
 }
 ```
 
@@ -74,12 +77,12 @@ Claude Code
 
 ### 1.2 `get_capture_info`
 
-获取当前已加载捕获文件的设备和环境信息。
+Get device and environment information for the currently loaded capture.
 
 ```json
 {
   "name": "get_capture_info",
-  "description": "获取当前捕获的设备环境信息：GPU 型号、驱动版本、API 版本、分辨率、RT 格式等。在排查手机端精度 / 兼容性 Bug 时，设备信息是关键线索——Adreno 和 Mali 的 half float 行为差异很大，很多爆闪 Bug 跟具体 GPU 强相关。",
+  "description": "Get device environment information for the current capture: GPU model, driver version, API version, resolution, RT formats, etc. When triaging mobile precision / compatibility bugs, device information is a key clue: half float behavior differs greatly between Adreno and Mali, and many bright-flash bugs are strongly GPU-specific.",
   "inputSchema": {
     "type": "object",
     "properties": {},
@@ -88,7 +91,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "gpu": "Adreno 640",
@@ -99,47 +102,48 @@ Claude Code
   "depth_format": "D24_UNORM_S8_UINT",
   "device_type": "mobile",
   "known_gpu_quirks": [
-    "Adreno: mediump float 实际精度可能低于 spec 要求",
-    "Adreno: R11G11B10_FLOAT 没有符号位，无法存储负值（负值被 clamp 到 0 或产生未定义行为）"
+    "Adreno: mediump float precision may actually be lower than the spec requires",
+    "Adreno: R11G11B10_FLOAT has no sign bit and cannot store negative values (negatives are clamped to 0 or cause undefined behavior)"
   ]
 }
 ```
 
-> **设计意图**：`known_gpu_quirks` 字段基于 GPU 型号自动附加已知的坑点，让 LLM 在后续分析时直接关联硬件特性。
+> **Design intent**: the `known_gpu_quirks` field automatically attaches known pitfalls based on the GPU model.
+> This lets the LLM tie later analysis directly to hardware characteristics.
 
 ---
 
-## 模块 2：Event 与 Draw Call 浏览
+## Module 2: Event and Draw Call Browsing
 
 ---
 
 ### 2.1 `list_events`
 
-获取帧中的事件列表。
+Get the list of events in the frame.
 
 ```json
 {
   "name": "list_events",
-  "description": "获取帧中的事件列表，按 render pass 分组的树状结构。支持按名称过滤（模糊匹配）和按事件类型过滤。返回的 event_id 用于所有后续查询。建议先用 brief=true 快速浏览帧结构，再对感兴趣的 pass 做详细查询。",
+  "description": "Get the list of events in the frame as a tree grouped by render pass. Supports filtering by name (fuzzy match) and by event type. The returned event_id is used in all subsequent queries. Recommended: browse the frame structure quickly with brief=true, then query the passes of interest in detail.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "filter": {
         "type": "string",
-        "description": "按名称模糊过滤，如 'shadow'、'reflection'、'TAA'、'bloom'、'postprocess'"
+        "description": "Fuzzy-filter by name, e.g. 'shadow', 'reflection', 'TAA', 'bloom', 'postprocess'"
       },
       "pass_name": {
         "type": "string",
-        "description": "只返回指定 render pass 内的事件"
+        "description": "Return only events inside the specified render pass"
       },
       "event_type": {
         "type": "string",
         "enum": ["all", "draw", "dispatch", "clear", "copy", "resolve"],
-        "description": "按事件类型过滤，默认 all"
+        "description": "Filter by event type, default all"
       },
       "brief": {
         "type": "boolean",
-        "description": "true = 只返回 event_id + 名称（快速浏览）；false = 包含 draw 参数和绑定的 shader 名。默认 true"
+        "description": "true = return only event_id + name (quick browse); false = include draw parameters and bound shader names. Default true"
       }
     },
     "required": []
@@ -151,18 +155,18 @@ Claude Code
 
 ### 2.2 `get_event_detail`
 
-获取单个事件的完整信息。
+Get full information for a single event.
 
 ```json
 {
   "name": "get_event_detail",
-  "description": "获取指定事件的完整详情：draw call 参数、绑定的 shader、绑定的所有纹理和 buffer、render target、viewport / scissor、以及 pipeline state 摘要。这是排查具体 draw call 问题的核心入口。返回的 resource_id 可用于 get_texture_info、read_texture_pixels 等资源查询工具。",
+  "description": "Get full details for the specified event: draw call parameters, bound shaders, all bound textures and buffers, render targets, viewport / scissor, and a pipeline state summary. This is the main entry point for investigating a specific draw call. The returned resource_id can be used with resource query tools such as get_texture_info and read_texture_pixels.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "event_id": {
         "type": "integer",
-        "description": "事件 ID，通过 list_events 获取"
+        "description": "Event ID, obtained via list_events"
       }
     },
     "required": ["event_id"]
@@ -170,7 +174,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "event_id": 1247,
@@ -194,40 +198,40 @@ Claude Code
   ],
   "depth_target": { "name": "SceneDepth", "format": "D24_UNORM_S8_UINT" },
   "pipeline_state_summary": {
-    "blend": "Src=One, Dst=Zero（不透明覆盖）",
+    "blend": "Src=One, Dst=Zero (opaque overwrite)",
     "depth_test": "enabled, func=LessEqual, write=true",
     "cull_mode": "Back",
     "stencil": "disabled"
   },
-  "next_steps_hint": "如需详细 pipeline state 使用 get_pipeline_state；如需查看 shader 源码使用 get_shader_source"
+  "next_steps_hint": "For detailed pipeline state use get_pipeline_state; to view shader source use get_shader_source"
 }
 ```
 
 ---
 
-## 模块 3：Pipeline State 深度查询
+## Module 3: Deep Pipeline State Queries
 
 ---
 
 ### 3.1 `get_pipeline_state`
 
-获取指定事件的完整渲染管线状态。
+Get the complete render pipeline state for the specified event.
 
 ```json
 {
   "name": "get_pipeline_state",
-  "description": "获取指定事件的完整渲染管线状态，包含 blend、depth/stencil、rasterizer、viewport/scissor、multisample 的全部参数。当 get_event_detail 的 pipeline_state_summary 不够详细时使用。常用于排查：倒影颜色偏暗（blend 配置 / color write mask 问题）、物体消失（depth / cull 问题）、半透明错误等。",
+  "description": "Get the complete render pipeline state for the specified event, including all parameters for blend, depth/stencil, rasterizer, viewport/scissor, and multisample. Use when the pipeline_state_summary from get_event_detail is not detailed enough. Commonly used to investigate: dark reflection color (blend configuration / color write mask issues), disappearing objects (depth / cull issues), incorrect transparency, etc.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "event_id": {
         "type": "integer",
-        "description": "事件 ID"
+        "description": "Event ID"
       },
       "section": {
         "type": "string",
         "enum": ["all", "blend", "depth_stencil", "rasterizer", "viewport", "multisample"],
-        "description": "只查看特定部分，默认 all"
+        "description": "View only a specific section, default all"
       }
     },
     "required": ["event_id"]
@@ -239,22 +243,22 @@ Claude Code
 
 ### 3.2 `compare_pipeline_state`
 
-对比两个事件的 pipeline state 差异，高亮不同点。
+Compare the pipeline state of two events and highlight the differences.
 
 ```json
 {
   "name": "compare_pipeline_state",
-  "description": "对比两个事件的渲染管线状态差异，只返回不同的字段。每个差异会附带 implication（影响推断）帮助定位问题。典型用法：对比原物体和其倒影的 draw call，找出为什么倒影偏暗（可能 blend 不同、shader 变体不同、color write mask 不同、gamma 处理不同）。也可对比同一个物体在不同 pass 中的渲染行为差异。",
+  "description": "Compare the render pipeline state of two events and return only the differing fields. Each difference comes with an implication to help locate the problem. Typical use: compare the draw call of an object with that of its reflection to find out why the reflection is darker (possibly a different blend, shader variant, color write mask, or gamma handling). Can also compare how the same object renders in different passes.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "event_id_a": {
         "type": "integer",
-        "description": "参考事件（通常是'正确'的那个）"
+        "description": "Reference event (usually the 'correct' one)"
       },
       "event_id_b": {
         "type": "integer",
-        "description": "待比较事件（通常是'有问题'的那个）"
+        "description": "Event to compare (usually the 'problematic' one)"
       }
     },
     "required": ["event_id_a", "event_id_b"]
@@ -262,7 +266,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "differences": [
@@ -270,59 +274,59 @@ Claude Code
       "field": "fragment_shader",
       "event_a": "MobileBasePass.usf (permutation: REFLECTION=0)",
       "event_b": "MobileBasePass.usf (permutation: REFLECTION=1)",
-      "implication": "反射 pass 使用了不同的 shader 变体分支，可能包含不同的光照 / tonemapping 逻辑"
+      "implication": "The reflection pass uses a different shader variant branch, which may contain different lighting / tonemapping logic"
     },
     {
       "field": "blend.color_src_factor",
       "event_a": "One",
       "event_b": "SrcAlpha",
-      "implication": "反射 pass 使用了 alpha blend，可能导致颜色被 alpha 值衰减而偏暗"
+      "implication": "The reflection pass uses alpha blend, which may attenuate the color by the alpha value and make it darker"
     }
   ],
   "identical_sections": ["depth_stencil", "rasterizer", "viewport"],
-  "summary": "发现 2 处差异，集中在 shader 变体和 blend 配置。blend 从 One 变为 SrcAlpha 是倒影颜色偏暗的最可能原因。"
+  "summary": "Found 2 differences, concentrated in shader variant and blend configuration. The blend change from One to SrcAlpha is the most likely cause of the darker reflection."
 }
 ```
 
 ---
 
-## 模块 4：Shader 分析
+## Module 4: Shader Analysis
 
 ---
 
 ### 4.1 `get_shader_source`
 
-获取 shader 源代码或反编译结果。
+Get shader source code or decompiled output.
 
 ```json
 {
   "name": "get_shader_source",
-  "description": "获取指定事件绑定的 shader 源代码。Vulkan 返回 SPIR-V 反编译的 GLSL/HLSL，OpenGL ES 返回原始 GLSL。用于分析 shader 逻辑错误、精度问题（half float 导致负值）、IBL 计算错误、tonemapping 溢出等。如果 shader 很长，可用 line_range 只看关键段落。",
+  "description": "Get the source code of the shader bound at the specified event. Vulkan returns GLSL/HLSL decompiled from SPIR-V; OpenGL ES returns the original GLSL. Used to analyze shader logic errors, precision issues (negative values from half float), IBL calculation errors, tonemapping overflow, etc. If the shader is long, use line_range to view only the key section.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "event_id": {
         "type": "integer",
-        "description": "事件 ID"
+        "description": "Event ID"
       },
       "stage": {
         "type": "string",
         "enum": ["vertex", "fragment", "compute"],
-        "description": "着色器阶段，默认 fragment"
+        "description": "Shader stage, default fragment"
       },
       "format": {
         "type": "string",
         "enum": ["hlsl", "glsl", "spirv_disasm"],
-        "description": "输出格式偏好，默认根据 API 自动选择"
+        "description": "Output format preference, default chosen automatically based on API"
       },
       "line_range": {
         "type": "array",
         "items": { "type": "integer" },
-        "description": "[start_line, end_line]，只返回指定行范围的代码"
+        "description": "[start_line, end_line], return only code in the given line range"
       },
       "search": {
         "type": "string",
-        "description": "在 shader 源码中搜索关键字，只返回匹配行及上下文（前后各 5 行）。如 'ibl'、'tonemap'、'clamp'、'saturate'"
+        "description": "Search the shader source for a keyword and return only matching lines with context (5 lines before and after). E.g. 'ibl', 'tonemap', 'clamp', 'saturate'"
       }
     },
     "required": ["event_id"]
@@ -334,31 +338,31 @@ Claude Code
 
 ### 4.2 `get_shader_constants`
 
-获取 shader 常量 buffer 的实际值。
+Get the actual values of the shader constant buffers.
 
 ```json
 {
   "name": "get_shader_constants",
-  "description": "获取指定事件的 shader 常量值（Constant Buffer / Uniform Buffer 的当前数值）。对排查以下问题至关重要：IBL 强度系数异常、反射矩阵不正交、曝光值溢出、HDR tonemapping 参数异常、TAA 的 jitter offset / feedback 权重等。可按变量名过滤只看关注的值。注意：CB 中的值是 float32，但 GPU 实际运算可能使用 half float（精度更低）。",
+  "description": "Get the shader constant values for the specified event (current values of Constant Buffers / Uniform Buffers). Essential for investigating: abnormal IBL intensity coefficients, non-orthogonal reflection matrices, exposure overflow, abnormal HDR tonemapping parameters, TAA jitter offset / feedback weights, etc. Can filter by variable name to see only the values of interest. Note: values in the CB are float32, but the GPU may actually compute in half float (lower precision).",
   "inputSchema": {
     "type": "object",
     "properties": {
       "event_id": {
         "type": "integer",
-        "description": "事件 ID"
+        "description": "Event ID"
       },
       "stage": {
         "type": "string",
         "enum": ["vertex", "fragment", "compute"],
-        "description": "着色器阶段，默认 fragment"
+        "description": "Shader stage, default fragment"
       },
       "buffer_slot": {
         "type": "integer",
-        "description": "只查看指定 slot 的 buffer，不指定则返回所有"
+        "description": "View only the buffer at the given slot; if omitted, return all"
       },
       "filter": {
         "type": "string",
-        "description": "按变量名模糊过滤，如 'reflection'、'exposure'、'ibl'、'taa'、'jitter'"
+        "description": "Fuzzy-filter by variable name, e.g. 'reflection', 'exposure', 'ibl', 'taa', 'jitter'"
       }
     },
     "required": ["event_id"]
@@ -370,40 +374,40 @@ Claude Code
 
 ### 4.3 `debug_shader_at_pixel`
 
-在指定像素位置单步执行 shader，返回每步的中间变量值。
+Step through the shader at the given pixel position and return intermediate variable values at each step.
 
 ```json
 {
   "name": "debug_shader_at_pixel",
-  "description": "对指定像素位置进行 shader 逐步调试，返回执行过程中每个变量在关键步骤的值。这是诊断精度和计算错误的终极工具。典型用例：(1) IBL 算出负数——追踪 SH 采样 → 乘以 baseColor → tonemapping 的全过程，找到哪步产生负值；(2) TAA 爆闪——追踪 history 采样 → motion vector → color clipping → blend 的过程；(3) 颜色偏差——追踪纹理采样 → 光照计算 → 输出的完整链路。自动标注异常值（NaN / Inf / 负值）。注意：此操作较慢（数秒），请针对性使用。",
+  "description": "Step-by-step debug the shader at the given pixel position, returning the value of each variable at key steps of execution. This is the most powerful tool for diagnosing precision and calculation errors. Typical uses: (1) IBL yields negative numbers: trace the whole path of SH sampling → multiply by baseColor → tonemapping to find which step produces the negative; (2) TAA bright flashes: trace history sampling → motion vector → color clipping → blend; (3) color shift: trace the full chain of texture sampling → lighting calculation → output. Anomalous values (NaN / Inf / negative) are flagged automatically. Note: this operation is slow (several seconds); use it selectively.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "event_id": {
         "type": "integer",
-        "description": "事件 ID"
+        "description": "Event ID"
       },
       "pixel_x": {
         "type": "integer",
-        "description": "像素 X 坐标（render target 空间，左上角为原点）"
+        "description": "Pixel X coordinate (render target space, origin at top-left)"
       },
       "pixel_y": {
         "type": "integer",
-        "description": "像素 Y 坐标"
+        "description": "Pixel Y coordinate"
       },
       "stage": {
         "type": "string",
         "enum": ["vertex", "fragment"],
-        "description": "调试阶段，默认 fragment"
+        "description": "Debug stage, default fragment"
       },
       "watch_variables": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "只追踪这些变量，如 ['color', 'iblDiffuse', 'exposure']。不指定则返回所有变量（数据量较大）"
+        "description": "Trace only these variables, e.g. ['color', 'iblDiffuse', 'exposure']. If omitted, all variables are returned (large output)"
       },
       "max_steps": {
         "type": "integer",
-        "description": "最大跟踪步数，默认 500"
+        "description": "Maximum number of trace steps, default 500"
       }
     },
     "required": ["event_id", "pixel_x", "pixel_y"]
@@ -411,7 +415,7 @@ Claude Code
 }
 ```
 
-**返回值**（面向 LLM 可读性优化）：
+**Return value** (optimized for LLM readability):
 ```json
 {
   "pixel": [1024, 512],
@@ -421,49 +425,49 @@ Claude Code
       "line": 142,
       "source": "half3 iblDiffuse = SampleSH(worldNormal);",
       "outputs": { "iblDiffuse": [0.35, 0.28, -0.02] },
-      "warning": "⚠️ iblDiffuse.b = -0.02，SH 采样在该法线方向产生负值"
+      "warning": "⚠️ iblDiffuse.b = -0.02, SH sampling produces a negative value in this normal direction"
     },
     {
       "line": 145,
       "source": "half3 finalColor = baseColor * iblDiffuse * iblIntensity;",
       "inputs": { "baseColor": [0.8, 0.7, 0.6], "iblDiffuse": [0.35, 0.28, -0.02], "iblIntensity": 1.5 },
       "outputs": { "finalColor": [0.42, 0.294, -0.018] },
-      "warning": "⚠️ finalColor.b = -0.018，负值被乘法放大"
+      "warning": "⚠️ finalColor.b = -0.018, the negative value is amplified by the multiplication"
     }
   ],
   "final_output": [0.42, 0.294, -0.018, 1.0],
-  "anomalies_summary": "检测到 2 处负值。根因：SH 采样在 line 142 产生负的 B 通道 (-0.02)，经 line 145 乘法传播到 finalColor。建议在 SH 采样后添加 max(0, x) clamp。"
+  "anomalies_summary": "2 negative values detected. Root cause: SH sampling at line 142 produces a negative B channel (-0.02), which propagates to finalColor through the multiplication at line 145. Suggest adding a max(0, x) clamp after SH sampling."
 }
 ```
 
 ---
 
-## 模块 5：像素级诊断
+## Module 5: Pixel-Level Diagnosis
 
 ---
 
 ### 5.1 `pixel_history`
 
-获取指定像素在整帧中被修改的完整历史。
+Get the full history of modifications to the given pixel over the whole frame.
 
 ```json
 {
   "name": "pixel_history",
-  "description": "获取指定像素被所有 draw call 修改的完整历史：每次修改前后的颜色值、depth / stencil test 结果、blend 方程。是排查'为什么这个像素是这个颜色'的最直接手段。也会列出被 reject（depth test fail 等）的 draw call 及其本应写入的值。典型用例：倒影偏暗（对比正常渲染和反射 pass 对同一像素的写入）、物体消失（查看是否被 depth/stencil reject）、颜色异常（追踪所有 blend 叠加过程）。",
+  "description": "Get the full history of all draw calls that modified the given pixel: color values before and after each modification, depth / stencil test results, and blend equations. The most direct way to answer 'why is this pixel this color'. Also lists draw calls that were rejected (depth test fail, etc.) and the values they would have written. Typical uses: dark reflection (compare writes to the same pixel by normal rendering and the reflection pass), disappearing object (check whether it was rejected by depth/stencil), abnormal color (trace all blend accumulation).",
   "inputSchema": {
     "type": "object",
     "properties": {
       "pixel_x": {
         "type": "integer",
-        "description": "像素 X 坐标"
+        "description": "Pixel X coordinate"
       },
       "pixel_y": {
         "type": "integer",
-        "description": "像素 Y 坐标"
+        "description": "Pixel Y coordinate"
       },
       "target_resource_id": {
         "type": "integer",
-        "description": "查询哪个 render target 上的历史。不指定 = 最终 backbuffer。可通过 get_event_detail 获取特定 RT 的 resource_id"
+        "description": "Which render target to query history on. If omitted, the final backbuffer is used. The resource_id of a specific RT can be obtained via get_event_detail"
       }
     },
     "required": ["pixel_x", "pixel_y"]
@@ -471,7 +475,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "pixel": [1024, 512],
@@ -490,7 +494,7 @@ Claude Code
       "shader_output": [0.72, 0.48, 0.41, 1.0],
       "color_after": [0.72, 0.48, 0.41, 1.0],
       "depth_test": "passed (0.847 < 1.0)",
-      "blend": "One / Zero（不透明覆盖）",
+      "blend": "One / Zero (opaque overwrite)",
       "passed": true
     },
     {
@@ -518,26 +522,26 @@ Claude Code
 
 ### 5.2 `sample_pixel_region`
 
-批量扫描区域像素值，自动检测异常。
+Scan region pixel values in bulk and detect anomalies automatically.
 
 ```json
 {
   "name": "sample_pixel_region",
-  "description": "在指定 render target 上批量采样像素值，自动检测 NaN / Inf / 负值 / 极端亮值。这是排查爆闪 Bug 的首选工具——不需要知道具体哪个像素有问题，直接扫描全屏找异常区域。移动端爆闪的根源通常是某些像素变成 Inf / NaN 或极端大值，然后通过 TAA history feedback 扩散到整个画面。此工具可快速定位'震源'。",
+  "description": "Sample pixel values in bulk on the given render target, automatically detecting NaN / Inf / negative / extremely bright values. This is the first-choice tool for investigating bright-flash bugs: you don't need to know which pixel is bad, just scan the whole screen for anomalous regions. On mobile, bright flashes usually originate from some pixels becoming Inf / NaN or extremely large values that then spread across the whole image through TAA history feedback. This tool quickly locates the 'epicenter'.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "event_id": {
         "type": "integer",
-        "description": "在此事件之后的状态上采样。不指定 = 最终输出"
+        "description": "Sample on the state after this event. If omitted, the final output is used"
       },
       "resource_id": {
         "type": "integer",
-        "description": "指定 render target 的 resource_id。不指定 = 当前 event 的输出 RT"
+        "description": "resource_id of the render target. If omitted, the output RT of the current event is used"
       },
       "region": {
         "type": "object",
-        "description": "采样区域 {x, y, width, height}。不指定 = 全屏均匀采样",
+        "description": "Sampling region {x, y, width, height}. If omitted, uniform full-screen sampling is used",
         "properties": {
           "x": { "type": "integer" },
           "y": { "type": "integer" },
@@ -547,11 +551,11 @@ Claude Code
       },
       "sample_count": {
         "type": "integer",
-        "description": "采样点数量，默认 256，均匀分布"
+        "description": "Number of sample points, default 256, uniformly distributed"
       },
       "anomaly_threshold": {
         "type": "number",
-        "description": "亮度超过此值标记为异常（用于 HDR RT），默认 10.0"
+        "description": "Brightness above this value is flagged as anomalous (for HDR RTs), default 10.0"
       }
     },
     "required": []
@@ -559,7 +563,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "render_target": "SceneColor (R11G11B10_FLOAT)",
@@ -581,38 +585,38 @@ Claude Code
     "mean": [2.84, 0.67, 0.52],
     "median": [0.45, 0.38, 0.32]
   },
-  "diagnosis_hint": "Inf 集中在 (830-840, 250-260) 区域，负值散布全帧。建议对异常像素执行 pixel_history 定位写入源头，并检查 TAA history buffer 是否存在负值累积。"
+  "diagnosis_hint": "Inf is concentrated in region (830-840, 250-260), negatives are scattered across the frame. Suggest running pixel_history on anomalous pixels to find the write source, and checking whether the TAA history buffer has accumulated negative values."
 }
 ```
 
 ---
 
-## 模块 6：资源检查
+## Module 6: Resource Inspection
 
 ---
 
 ### 6.1 `get_texture_info`
 
-获取纹理元数据和值域统计。
+Get texture metadata and value range statistics.
 
 ```json
 {
   "name": "get_texture_info",
-  "description": "获取纹理的格式、尺寸、mip 数量，以及内容的数值统计（min / max / mean / NaN 检测）。不返回完整像素数据。用于快速判断纹理是否有异常：全黑？包含 NaN？值域不正常？格式与预期不符（如该用 SRGB 但实际是 UNORM 导致 gamma 双重校正）？IBL cubemap 某个面是否包含负值？",
+  "description": "Get a texture's format, size, mip count, and numeric statistics of its content (min / max / mean / NaN detection). Does not return full pixel data. Used to quickly judge whether a texture is abnormal: all black? contains NaN? abnormal value range? format differs from expected (e.g. should be SRGB but is actually UNORM, causing double gamma correction)? does some face of the IBL cubemap contain negative values?",
   "inputSchema": {
     "type": "object",
     "properties": {
       "resource_id": {
         "type": "integer",
-        "description": "纹理 resource_id，通过 get_event_detail 的 bound_textures 获取"
+        "description": "Texture resource_id, obtained from bound_textures of get_event_detail"
       },
       "mip_level": {
         "type": "integer",
-        "description": "查看的 mip 层级，默认 0"
+        "description": "Mip level to inspect, default 0"
       },
       "all_slices": {
         "type": "boolean",
-        "description": "true = 分别统计每个 array slice / cubemap face。对 cubemap 会返回 6 个面各自的统计。默认 false"
+        "description": "true = compute statistics separately for each array slice / cubemap face. For a cubemap, returns statistics for each of the 6 faces. Default false"
       }
     },
     "required": ["resource_id"]
@@ -620,7 +624,7 @@ Claude Code
 }
 ```
 
-**返回值**（cubemap 示例）：
+**Return value** (cubemap example):
 ```json
 {
   "name": "IBL_Cubemap",
@@ -638,7 +642,7 @@ Claude Code
     { "face": "-Z", "min": [0.0, 0.0, -0.001], "max": [3.8, 3.5, 4.7], "has_nan": false, "has_negative": true }
   ],
   "warnings": [
-    "⚠️ -X 面和 -Z 面包含微小负值，可能在 SH projection 或 filtering 过程中引入"
+    "⚠️ The -X and -Z faces contain tiny negative values, possibly introduced during SH projection or filtering"
   ]
 }
 ```
@@ -647,22 +651,22 @@ Claude Code
 
 ### 6.2 `read_texture_pixels`
 
-读取纹理指定区域的实际像素值。
+Read actual pixel values for a given region of a texture.
 
 ```json
 {
   "name": "read_texture_pixels",
-  "description": "读取纹理中指定区域的实际像素值（浮点精度）。区域大小限制 64x64 以控制返回数据量。用于精确检查：IBL cubemap 某个方向的具体数值、SH 系数贴图内容、LUT 贴图的采样值、history buffer 的累积值等。",
+  "description": "Read actual pixel values (float precision) in the given region of a texture. Region size is limited to 64x64 to control the amount of returned data. Used for precise inspection: specific values of the IBL cubemap in some direction, SH coefficient texture contents, LUT sampled values, accumulated values in the history buffer, etc.",
   "inputSchema": {
     "type": "object",
     "properties": {
-      "resource_id": { "type": "integer", "description": "纹理 resource_id" },
+      "resource_id": { "type": "integer", "description": "Texture resource_id" },
       "x": { "type": "integer" },
       "y": { "type": "integer" },
-      "width": { "type": "integer", "description": "最大 64" },
-      "height": { "type": "integer", "description": "最大 64" },
-      "mip_level": { "type": "integer", "description": "mip 层级，默认 0" },
-      "array_slice": { "type": "integer", "description": "数组 / cubemap slice，cubemap: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z" }
+      "width": { "type": "integer", "description": "Max 64" },
+      "height": { "type": "integer", "description": "Max 64" },
+      "mip_level": { "type": "integer", "description": "Mip level, default 0" },
+      "array_slice": { "type": "integer", "description": "Array / cubemap slice, cubemap: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z" }
     },
     "required": ["resource_id", "x", "y", "width", "height"]
   }
@@ -673,26 +677,26 @@ Claude Code
 
 ### 6.3 `read_buffer_data`
 
-读取 buffer 内容。
+Read buffer contents.
 
 ```json
 {
   "name": "read_buffer_data",
-  "description": "读取 buffer（Vertex Buffer / Index Buffer / Constant Buffer / SSBO）的内容。可按 float32 / float16 / uint 等格式解释原始数据，或对 Vertex Buffer 按绑定的 layout 自动解析出每个顶点属性。用于排查：顶点位置为 NaN、constant buffer 中的矩阵异常、SSBO 中的计算结果错误等。",
+  "description": "Read the contents of a buffer (Vertex Buffer / Index Buffer / Constant Buffer / SSBO). Raw data can be interpreted as float32 / float16 / uint etc., or a Vertex Buffer can be parsed automatically into per-vertex attributes using the bound layout. Used to investigate: NaN vertex positions, abnormal matrices in a constant buffer, wrong compute results in an SSBO, etc.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "resource_id": { "type": "integer" },
-      "offset_bytes": { "type": "integer", "description": "起始偏移，默认 0" },
-      "length_bytes": { "type": "integer", "description": "读取长度，默认 1024，最大 4096" },
+      "offset_bytes": { "type": "integer", "description": "Start offset, default 0" },
+      "length_bytes": { "type": "integer", "description": "Read length, default 1024, max 4096" },
       "interpret_as": {
         "type": "string",
         "enum": ["raw_hex", "float32", "float16", "uint32", "uint16", "vertex_buffer"],
-        "description": "数据解释方式。vertex_buffer 按绑定的 layout 解析"
+        "description": "How to interpret the data. vertex_buffer parses using the bound layout"
       },
       "event_id": {
         "type": "integer",
-        "description": "关联的事件 ID（vertex_buffer 模式下用于获取 layout）"
+        "description": "Associated event ID (used in vertex_buffer mode to get the layout)"
       }
     },
     "required": ["resource_id"]
@@ -702,34 +706,34 @@ Claude Code
 
 ---
 
-## 模块 7：性能分析
+## Module 7: Performance Analysis
 
 ---
 
 ### 7.1 `get_pass_timing`
 
-获取各 render pass / draw call 的 GPU 耗时。
+Get GPU time for each render pass / draw call.
 
 ```json
 {
   "name": "get_pass_timing",
-  "description": "获取帧中各 render pass 或各 draw call 的 GPU 耗时统计，默认按耗时从高到低排序。用于快速定位性能瓶颈。注意：移动端 tile-based GPU 上的 timing 可能不完全反映实际开销（tile load/store 不会被单独计时）。",
+  "description": "Get GPU time statistics for each render pass or draw call in the frame, sorted by time descending by default. Used to quickly locate performance bottlenecks. Note: timing on mobile tile-based GPUs may not fully reflect the actual cost (tile load/store is not timed separately).",
   "inputSchema": {
     "type": "object",
     "properties": {
       "granularity": {
         "type": "string",
         "enum": ["pass", "draw_call"],
-        "description": "统计粒度，默认 pass"
+        "description": "Statistics granularity, default pass"
       },
       "sort_by": {
         "type": "string",
         "enum": ["time_desc", "time_asc", "order"],
-        "description": "排序方式，默认 time_desc"
+        "description": "Sort order, default time_desc"
       },
       "top_n": {
         "type": "integer",
-        "description": "只返回前 N 个，默认 20"
+        "description": "Return only the top N, default 20"
       }
     },
     "required": []
@@ -741,19 +745,19 @@ Claude Code
 
 ### 7.2 `analyze_overdraw`
 
-分析 overdraw 情况。
+Analyze overdraw.
 
 ```json
 {
   "name": "analyze_overdraw",
-  "description": "分析帧中 overdraw 情况：平均 overdraw 倍率、overdraw 最严重的区域、导致 overdraw 最多的 draw call。移动端的 fill rate 和带宽是主要瓶颈，overdraw 直接影响帧率和耗电。可只分析指定 pass（如不透明 pass 或半透明 pass）。",
+  "description": "Analyze overdraw in the frame: average overdraw ratio, the regions with the worst overdraw, and the draw calls causing the most overdraw. Fill rate and bandwidth are the main bottlenecks on mobile; overdraw directly affects frame rate and power consumption. Can analyze only specified passes (such as the opaque or transparent pass).",
   "inputSchema": {
     "type": "object",
     "properties": {
-      "pass_name": { "type": "string", "description": "只分析指定 pass，不指定 = 全帧" },
+      "pass_name": { "type": "string", "description": "Analyze only the given pass; if omitted, the whole frame is analyzed" },
       "region": {
         "type": "object",
-        "description": "只分析指定区域 {x, y, width, height}",
+        "description": "Analyze only the given region {x, y, width, height}",
         "properties": {
           "x": { "type": "integer" }, "y": { "type": "integer" },
           "width": { "type": "integer" }, "height": { "type": "integer" }
@@ -769,19 +773,19 @@ Claude Code
 
 ### 7.3 `analyze_bandwidth`
 
-估算显存带宽消耗。
+Estimate memory bandwidth consumption.
 
 ```json
 {
   "name": "analyze_bandwidth",
-  "description": "估算帧渲染的显存带宽消耗：纹理读取、RT 读写、buffer 读取的总量和分布。在 tile-based GPU（移动端）上还分析 tile load/store 开销，识别不必要的 full-screen resolve。带宽是移动端 GPU 的最大性能瓶颈和发热来源。",
+  "description": "Estimate memory bandwidth consumed by frame rendering: total and distribution of texture reads, RT reads/writes, and buffer reads. On tile-based GPUs (mobile), also analyzes tile load/store cost and identifies unnecessary full-screen resolves. Bandwidth is the biggest performance bottleneck and heat source for mobile GPUs.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "breakdown_by": {
         "type": "string",
         "enum": ["pass", "resource_type", "operation"],
-        "description": "拆分维度，默认 pass"
+        "description": "Breakdown dimension, default pass"
       }
     },
     "required": []
@@ -793,12 +797,12 @@ Claude Code
 
 ### 7.4 `analyze_state_changes`
 
-分析 draw call 之间的状态切换和合批机会。
+Analyze state changes between draw calls and batching opportunities.
 
 ```json
 {
   "name": "analyze_state_changes",
-  "description": "分析帧中 draw call 之间的渲染状态切换频率，识别合批（batching）机会。统计 shader / 纹理 / RT / blend state 的切换次数和模式，返回哪些连续 draw call 状态一致可以合并，以及如果调整渲染顺序能减少多少切换。",
+  "description": "Analyze the frequency of render state changes between draw calls in the frame and identify batching opportunities. Counts the number and pattern of shader / texture / RT / blend state changes, and returns which consecutive draw calls have identical state and can be merged, and how many changes would be saved by reordering rendering.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -809,7 +813,7 @@ Claude Code
           "type": "string",
           "enum": ["shader", "texture", "render_target", "blend", "depth_stencil", "vertex_buffer"]
         },
-        "description": "关注的切换类型，默认全部"
+        "description": "Change types of interest, default all"
       }
     },
     "required": []
@@ -819,31 +823,31 @@ Claude Code
 
 ---
 
-## 模块 8：智能诊断（高级封装）
+## Module 8: Smart Diagnostics (High-Level Wrappers)
 
-这一层将多步底层操作封装为一步完成的诊断流程，面向特定 Bug 类型。
+This layer wraps multi-step low-level operations into a single diagnostic flow aimed at specific bug types.
 
 ---
 
 ### 8.1 `diagnose_negative_values`
 
-全帧扫描负值问题——对应 IBL 负数、TAA 爆闪等场景。
+Full-frame scan for negative values, covering scenarios such as IBL negatives and TAA bright flashes.
 
 ```json
 {
   "name": "diagnose_negative_values",
-  "description": "全帧扫描所有浮点格式 render target 中的负值像素，定位负值首次出现的 draw call，并追溯负值来源。自动分析 TAA history buffer 是否在放大负值（每帧累积扩散是爆闪的典型模式）。返回根因候选和修复建议。一站式覆盖 'IBL 算出负数' → 'TAA 放大' → '爆闪' 的完整链路。",
+  "description": "Scan all float-format render targets in the whole frame for pixels with negative values, locate the draw call where negatives first appear, and trace their source. Automatically analyzes whether the TAA history buffer is amplifying negatives (per-frame accumulating spread is the typical bright-flash pattern). Returns root cause candidates and fix suggestions. One-stop coverage of the full chain 'IBL yields negatives' → 'TAA amplifies' → 'bright flashes'.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "check_targets": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "指定要检查的 RT 名称，如 ['SceneColor', 'TAAHistory']。不指定 = 检查所有浮点 RT"
+        "description": "RT names to check, e.g. ['SceneColor', 'TAAHistory']. If omitted, all float RTs are checked"
       },
       "trace_depth": {
         "type": "integer",
-        "description": "发现负值后向前追溯几个 event 定位来源，默认 5"
+        "description": "How many events to trace back after finding negatives to locate the source, default 5"
       }
     },
     "required": []
@@ -851,7 +855,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "scan_result": "NEGATIVE_VALUES_DETECTED",
@@ -878,21 +882,21 @@ Claude Code
         "name": "DrawIndexed - TAA_Resolve",
         "new_negative_pixels": 183
       },
-      "accumulation_warning": "TAAHistory 负值数 (183) 是 SceneColor (47) 的 3.9 倍，TAA feedback 正在放大负值，持续累积将导致爆闪"
+      "accumulation_warning": "TAAHistory negative count (183) is 3.9 times SceneColor's (47); TAA feedback is amplifying negatives, and continued accumulation will cause bright flashes"
     }
   ],
   "root_cause_candidates": [
     {
-      "likelihood": "高",
-      "cause": "IBL SH 采样在部分法线方向产生负值",
-      "evidence": "event 892 首次引入 23 个负值像素",
-      "fix": "SH 采样后添加 max(0, result) clamp，或改用非负 SH 基函数"
+      "likelihood": "high",
+      "cause": "IBL SH sampling produces negative values in some normal directions",
+      "evidence": "event 892 first introduces 23 negative pixels",
+      "fix": "Add a max(0, result) clamp after SH sampling, or use a non-negative SH basis"
     },
     {
-      "likelihood": "高",
-      "cause": "TAA color clipping 未处理负值输入",
-      "evidence": "TAAHistory 负值是 SceneColor 的 3.9 倍",
-      "fix": "TAA shader 中对 history sample 和 neighborhood AABB 的下界 clamp 到 0"
+      "likelihood": "high",
+      "cause": "TAA color clipping does not handle negative input",
+      "evidence": "TAAHistory has 3.9 times as many negatives as SceneColor",
+      "fix": "In the TAA shader, clamp the lower bound of the history sample and neighborhood AABB to 0"
     }
   ]
 }
@@ -902,23 +906,23 @@ Claude Code
 
 ### 8.2 `diagnose_precision_issues`
 
-检测 half float 精度问题——对应移动端精度 Bug。
+Detect half float precision problems, covering mobile precision bugs.
 
 ```json
 {
   "name": "diagnose_precision_issues",
-  "description": "检测帧中可能的浮点精度问题。分析：(1) half float 格式 RT 上的精度丢失（对比 float32 参考值，如果有的话）；(2) shader 中的 mediump 变量在极端值附近的行为；(3) R11G11B10_FLOAT 的特殊限制（无符号位、有限精度）；(4) 深度 buffer 的精度不足导致 z-fighting。返回检测到的精度问题列表和每个问题的影响评估。",
+  "description": "Detect possible floating-point precision problems in the frame. Analyzes: (1) precision loss on half float format RTs (compared with a float32 reference, if available); (2) behavior of mediump variables in shaders near extreme values; (3) special limitations of R11G11B10_FLOAT (no sign bit, limited precision); (4) insufficient depth buffer precision causing z-fighting. Returns a list of detected precision issues with an impact assessment for each.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "focus": {
         "type": "string",
         "enum": ["all", "color_precision", "depth_precision", "shader_precision"],
-        "description": "关注的精度维度，默认 all"
+        "description": "Precision dimension of interest, default all"
       },
       "threshold": {
         "type": "number",
-        "description": "精度偏差超过此阈值才报告（相对误差），默认 0.01 (1%)"
+        "description": "Report only when the precision deviation exceeds this threshold (relative error), default 0.01 (1%)"
       }
     },
     "required": []
@@ -926,26 +930,26 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "issues_found": [
     {
       "type": "format_limitation",
       "target": "SceneColor (R11G11B10_FLOAT)",
-      "description": "R11G11B10_FLOAT 没有符号位，无法存储负值。任何写入该 RT 的负值会被 clamp 到 0 或产生未定义行为。",
+      "description": "R11G11B10_FLOAT has no sign bit and cannot store negative values. Any negative value written to this RT is clamped to 0 or causes undefined behavior.",
       "affected_events": [892, 945, 1023],
       "severity": "high",
-      "fix": "如果流程中存在合法负值（如 SH 采样），需要在写入该 RT 前 clamp 到 [0, max]，或改用 R16G16B16A16_FLOAT（但会增加带宽开销）"
+      "fix": "If legitimate negative values exist in the pipeline (such as from SH sampling), clamp to [0, max] before writing to this RT, or switch to R16G16B16A16_FLOAT (at the cost of more bandwidth)"
     },
     {
       "type": "depth_precision",
-      "description": "D24 深度 buffer 在远平面附近精度不足，near=0.1 far=1000 时 z=500 以外的精度约为 0.3 世界单位",
+      "description": "The D24 depth buffer lacks precision near the far plane; with near=0.1 and far=1000, precision beyond z=500 is about 0.3 world units",
       "z_fighting_risk_zones": [
         { "depth_range": [800, 1000], "precision": "~1.2 world units", "risk": "high" }
       ],
       "severity": "medium",
-      "fix": "考虑使用 reversed-Z + D32_FLOAT，或缩小 far plane"
+      "fix": "Consider reversed-Z + D32_FLOAT, or shrink the far plane"
     }
   ]
 }
@@ -955,22 +959,22 @@ Claude Code
 
 ### 8.3 `diagnose_reflection_mismatch`
 
-专门诊断反射 / 倒影颜色不匹配问题。
+Dedicated diagnosis of reflection color mismatch.
 
 ```json
 {
   "name": "diagnose_reflection_mismatch",
-  "description": "诊断反射 / 倒影与原物体之间的颜色差异问题（如倒影偏暗、偏色、缺失高光）。自动执行：(1) 识别帧中的反射相关 pass（SceneCapture / Planar Reflection / SSR 等）；(2) 找到同一个物体在正常渲染和反射 pass 中的 draw call；(3) 对比两者的 shader 变体、pipeline state、绑定的纹理和常量；(4) 在可配对的像素上对比最终颜色值。返回所有差异及其对颜色的影响分析。",
+  "description": "Diagnose color differences between a reflection and its original object (e.g. dark reflection, color cast, missing highlights). Automatically: (1) identifies reflection-related passes in the frame (SceneCapture / Planar Reflection / SSR, etc.); (2) finds the draw calls for the same object in normal rendering and in the reflection pass; (3) compares their shader variants, pipeline state, bound textures, and constants; (4) compares final color values at pixels that can be paired. Returns all differences and their impact analysis on color.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "reflection_pass_hint": {
         "type": "string",
-        "description": "反射 pass 的名称提示，如 'SceneCapture'、'PlanarReflection'、'SSR'。不指定则自动检测"
+        "description": "Name hint for the reflection pass, e.g. 'SceneCapture', 'PlanarReflection', 'SSR'. Detected automatically if omitted"
       },
       "object_hint": {
         "type": "string",
-        "description": "要对比的物体名称提示，如 'SM_Rock'。不指定则选择差异最大的物体"
+        "description": "Name hint for the object to compare, e.g. 'SM_Rock'. If omitted, the object with the largest difference is chosen"
       }
     },
     "required": []
@@ -978,7 +982,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "reflection_type": "SceneCapture (Planar Reflection)",
@@ -991,46 +995,48 @@ Claude Code
         "sample_pixel_normal": [0.72, 0.48, 0.41],
         "sample_pixel_reflection": [0.52, 0.35, 0.30],
         "brightness_ratio": 0.72,
-        "description": "反射比正常渲染暗约 28%"
+        "description": "The reflection is about 28% darker than normal rendering"
       },
       "causes": [
         {
           "factor": "shader_variant",
-          "detail": "反射 pass 使用 REFLECTION=1 变体，该变体跳过了 IBL specular 计算",
-          "estimated_impact": "亮度降低 ~15%",
-          "fix": "在 REFLECTION=1 变体中保留 IBL specular 项，或使用简化版本"
+          "detail": "The reflection pass uses the REFLECTION=1 variant, which skips the IBL specular calculation",
+          "estimated_impact": "Brightness reduced by ~15%",
+          "fix": "Keep the IBL specular term in the REFLECTION=1 variant, or use a simplified version"
         },
         {
           "factor": "blend_state",
-          "detail": "反射 pass 的 blend src 从 One 变为 SrcAlpha，而 alpha 值为 0.85",
-          "estimated_impact": "亮度降低 ~15%",
-          "fix": "检查反射 pass 是否需要 alpha blend，如果不需要应改为 One/Zero"
+          "detail": "The reflection pass's blend src changes from One to SrcAlpha, and the alpha value is 0.85",
+          "estimated_impact": "Brightness reduced by ~15%",
+          "fix": "Check whether the reflection pass needs alpha blend; if not, change it to One/Zero"
         },
         {
           "factor": "render_target_format",
-          "detail": "反射 RT 分辨率 (600x270) 是主 RT (1200x540) 的 1/4，但格式相同",
-          "estimated_impact": "分辨率不影响亮度，但可能影响高光细节",
-          "fix": "无需修改"
+          "detail": "The reflection RT resolution (600x270) is 1/4 of the main RT (1200x540), but the format is the same",
+          "estimated_impact": "Resolution does not affect brightness, but may affect highlight detail",
+          "fix": "No change needed"
         }
       ],
-      "total_estimated_brightness_loss": "~28%（与实测 28% 吻合）"
+      "total_estimated_brightness_loss": "~28% (matches the measured 28%)"
     }
   ]
 }
 ```
 
-> **设计意图**：这个工具完整覆盖了"倒影为什么偏暗"的排查。不需要 LLM 自己去找反射 pass、配对 draw call、对比 state——一步完成。
+> **Design intent**: this tool fully covers the investigation of "why is the reflection darker".
+> The LLM does not need to find the reflection pass, pair draw calls, and compare state itself.
+> It is done in one step.
 
 ---
 
 ### 8.4 `diagnose_mobile_risks`
 
-基于帧数据预检移动端常见风险。
+Pre-check common mobile risks based on frame data.
 
 ```json
 {
   "name": "diagnose_mobile_risks",
-  "description": "基于当前帧数据，全面检测移动端常见的渲染风险和潜在 Bug。检查项包括：(1) 精度风险：half float RT 中的极端值、R11G11B10 存储负值、深度精度不足；(2) 性能风险：过高的 overdraw、不必要的全屏 pass、带宽过大的 RT、过多的状态切换；(3) 兼容性风险：依赖桌面端特性（如几何着色器）、超出移动端限制的纹理大小或采样器数量；(4) 已知 GPU 特定问题（基于 get_capture_info 的 GPU 型号）。返回风险列表和优先级排序。",
+  "description": "Based on the current frame data, check thoroughly for common mobile rendering risks and potential bugs. Checks include: (1) precision risks: extreme values in half float RTs, negatives stored in R11G11B10, insufficient depth precision; (2) performance risks: excessive overdraw, unnecessary full-screen passes, RTs with excessive bandwidth, too many state changes; (3) compatibility risks: reliance on desktop features (such as geometry shaders), texture sizes or sampler counts exceeding mobile limits; (4) known GPU-specific issues (based on the GPU model from get_capture_info). Returns a risk list with priority ordering.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -1040,12 +1046,12 @@ Claude Code
           "type": "string",
           "enum": ["precision", "performance", "compatibility", "gpu_specific"]
         },
-        "description": "要检查的类别，默认全部"
+        "description": "Categories to check, default all"
       },
       "severity_filter": {
         "type": "string",
         "enum": ["all", "high", "medium"],
-        "description": "只返回指定严重程度以上的风险，默认 all"
+        "description": "Return only risks at or above the given severity, default all"
       }
     },
     "required": []
@@ -1053,7 +1059,7 @@ Claude Code
 }
 ```
 
-**返回值**：
+**Return value**:
 ```json
 {
   "device": "Adreno 640 / Vulkan 1.1",
@@ -1061,248 +1067,254 @@ Claude Code
     {
       "category": "precision",
       "severity": "high",
-      "title": "R11G11B10_FLOAT 存储负值风险",
-      "detail": "SceneColor 使用 R11G11B10_FLOAT（无符号位），但 IBL pass 写入了负值。在 Adreno 上负值会被 clamp 到 0，在 Mali 上行为未定义。",
+      "title": "R11G11B10_FLOAT negative value storage risk",
+      "detail": "SceneColor uses R11G11B10_FLOAT (no sign bit), but the IBL pass writes negative values. On Adreno negatives are clamped to 0; on Mali the behavior is undefined.",
       "affected_events": [892, 945],
-      "fix": "IBL shader 输出 clamp 到 0，或将 SceneColor 改为 R16G16B16A16_FLOAT"
+      "fix": "Clamp IBL shader output to 0, or change SceneColor to R16G16B16A16_FLOAT"
     },
     {
       "category": "precision",
       "severity": "high",
-      "title": "TAA 负值累积导致爆闪风险",
-      "detail": "TAAHistory (R16G16B16A16_FLOAT) 中检测到 183 个负值像素，且数量超过上游 SceneColor 的负值数，说明 TAA feedback 在累积放大负值。",
-      "fix": "TAA shader 中 clamp history 采样和 AABB 下界到 0"
+      "title": "TAA negative accumulation risks bright flashes",
+      "detail": "183 negative pixels detected in TAAHistory (R16G16B16A16_FLOAT), and the count exceeds that of the upstream SceneColor, indicating TAA feedback is accumulating and amplifying negatives.",
+      "fix": "In the TAA shader, clamp the history sample and AABB lower bound to 0"
     },
     {
       "category": "performance",
       "severity": "high",
-      "title": "全屏 pass 过多",
-      "detail": "检测到 8 个全屏 post-process pass，总耗时 4.2ms（占帧时长 25%）。其中 Bloom 降采样 4 级 + 升采样 4 级共 8 个 pass。",
-      "fix": "考虑合并 bloom pass（每级降采样和升采样合并为单 pass），或减少 bloom 层级数"
+      "title": "Too many full-screen passes",
+      "detail": "8 full-screen post-process passes detected, totaling 4.2ms (25% of frame time). Of these, Bloom has 4 downsample + 4 upsample levels, 8 passes in total.",
+      "fix": "Consider merging bloom passes (merge each level's downsample and upsample into a single pass), or reduce the number of bloom levels"
     },
     {
       "category": "performance",
       "severity": "medium",
-      "title": "半透明 overdraw 过高",
-      "detail": "半透明 pass 平均 overdraw 3.7x，屏幕中心区域最高达 8.2x（粒子特效叠加区域）。",
-      "fix": "减少粒子层数、使用更小的粒子 quad、开启 soft particle 裁剪"
+      "title": "Transparent overdraw too high",
+      "detail": "The transparent pass averages 3.7x overdraw, up to 8.2x in the screen center (where particle effects overlap).",
+      "fix": "Reduce particle layers, use smaller particle quads, enable soft particle culling"
     },
     {
       "category": "performance",
       "severity": "medium",
-      "title": "不必要的 RT resolve",
-      "detail": "检测到 3 次 MSAA resolve 操作，但后续 pass 没有使用 resolve 后的数据。tile-based GPU 上每次 resolve 都有显著带宽成本。",
-      "fix": "移除未使用的 resolve，或使用 subpass 自动 resolve"
+      "title": "Unnecessary RT resolve",
+      "detail": "3 MSAA resolve operations detected, but later passes do not use the resolved data. Each resolve has a significant bandwidth cost on tile-based GPUs.",
+      "fix": "Remove unused resolves, or use subpass automatic resolve"
     },
     {
       "category": "compatibility",
       "severity": "low",
-      "title": "纹理采样器数量接近限制",
-      "detail": "event 1023 的 fragment shader 绑定了 14 个纹理采样器，部分低端移动 GPU 限制为 16 个。",
-      "fix": "合并纹理 atlas 或使用纹理数组减少采样器绑定数"
+      "title": "Sampler count near the limit",
+      "detail": "The fragment shader of event 1023 binds 14 texture samplers; some low-end mobile GPUs limit this to 16.",
+      "fix": "Merge into texture atlases or use texture arrays to reduce the number of bound samplers"
     },
     {
       "category": "gpu_specific",
       "severity": "medium",
-      "title": "Adreno mediump 精度低于标准",
-      "detail": "Adreno 640 的 mediump float 实际精度约为 FP16 的最低要求，在法线重建和 lighting 计算中可能产生可见瑕疵。",
-      "fix": "关键计算（法线重建、反射方向计算）强制使用 highp"
+      "title": "Adreno mediump precision below standard",
+      "detail": "Adreno 640's mediump float precision is about the minimum FP16 requirement, which may produce visible artifacts in normal reconstruction and lighting calculations.",
+      "fix": "Force highp for critical calculations (normal reconstruction, reflection direction calculation)"
     }
   ],
-  "summary": "发现 7 个风险项（2 个 high / 3 个 medium / 1 个 low / 1 个 gpu_specific）。最高优先级：修复 IBL 负值和 TAA 负值累积问题以消除爆闪风险。"
+  "summary": "Found 7 risk items (2 high / 3 medium / 1 low / 1 gpu_specific). Top priority: fix the IBL negative values and TAA negative accumulation to remove the bright-flash risk."
 }
 ```
 
 ---
 
-## 工具一览表
+## Tool Overview
 
-| # | 工具名 | 模块 | 核心用途 |
+| # | Tool | Module | Core Purpose |
 |---|--------|------|---------|
-| 1 | `load_capture` | 捕获管理 | 加载 .rdc 文件 |
-| 2 | `get_capture_info` | 捕获管理 | 获取设备 / 环境信息 |
-| 3 | `list_events` | Event 浏览 | 浏览帧中所有事件（支持过滤） |
-| 4 | `get_event_detail` | Event 浏览 | 获取单个事件的完整信息 |
-| 5 | `get_pipeline_state` | Pipeline State | 获取完整渲染管线状态 |
-| 6 | `compare_pipeline_state` | Pipeline State | 对比两个事件的 state 差异 |
-| 7 | `get_shader_source` | Shader 分析 | 获取 shader 源码（支持搜索） |
-| 8 | `get_shader_constants` | Shader 分析 | 获取 constant buffer 数值 |
-| 9 | `debug_shader_at_pixel` | Shader 分析 | 单像素 shader 逐步调试 |
-| 10 | `pixel_history` | 像素诊断 | 像素的完整修改历史 |
-| 11 | `sample_pixel_region` | 像素诊断 | 区域批量采样 + 异常检测 |
-| 12 | `get_texture_info` | 资源检查 | 纹理元数据 + 值域统计 |
-| 13 | `read_texture_pixels` | 资源检查 | 读取纹理区域像素值 |
-| 14 | `read_buffer_data` | 资源检查 | 读取 buffer 内容 |
-| 15 | `get_pass_timing` | 性能分析 | 各 pass 的 GPU 耗时 |
-| 16 | `analyze_overdraw` | 性能分析 | overdraw 分析 |
-| 17 | `analyze_bandwidth` | 性能分析 | 显存带宽估算 |
-| 18 | `analyze_state_changes` | 性能分析 | 状态切换分析 + 合批建议 |
-| 19 | `diagnose_negative_values` | 智能诊断 | 负值扫描 + 根因追溯 |
-| 20 | `diagnose_precision_issues` | 智能诊断 | 精度问题检测 |
-| 21 | `diagnose_reflection_mismatch` | 智能诊断 | 反射颜色差异诊断 |
-| 22 | `diagnose_mobile_risks` | 智能诊断 | 移动端风险全面预检 |
+| 1 | `load_capture` | Capture File Management | Load .rdc file |
+| 2 | `get_capture_info` | Capture File Management | Get device / environment info |
+| 3 | `list_events` | Event Browsing | Browse all events in the frame (with filtering) |
+| 4 | `get_event_detail` | Event Browsing | Get full information for a single event |
+| 5 | `get_pipeline_state` | Pipeline State | Get full render pipeline state |
+| 6 | `compare_pipeline_state` | Pipeline State | Compare state differences between two events |
+| 7 | `get_shader_source` | Shader Analysis | Get shader source (with search) |
+| 8 | `get_shader_constants` | Shader Analysis | Get constant buffer values |
+| 9 | `debug_shader_at_pixel` | Shader Analysis | Step-by-step shader debugging at a single pixel |
+| 10 | `pixel_history` | Pixel Diagnosis | Full modification history of a pixel |
+| 11 | `sample_pixel_region` | Pixel Diagnosis | Bulk region sampling + anomaly detection |
+| 12 | `get_texture_info` | Resource Inspection | Texture metadata + value range statistics |
+| 13 | `read_texture_pixels` | Resource Inspection | Read texture region pixel values |
+| 14 | `read_buffer_data` | Resource Inspection | Read buffer contents |
+| 15 | `get_pass_timing` | Performance Analysis | GPU time per pass |
+| 16 | `analyze_overdraw` | Performance Analysis | Overdraw analysis |
+| 17 | `analyze_bandwidth` | Performance Analysis | Memory bandwidth estimate |
+| 18 | `analyze_state_changes` | Performance Analysis | State change analysis + batching suggestions |
+| 19 | `diagnose_negative_values` | Smart Diagnostics | Negative value scan + root cause tracing |
+| 20 | `diagnose_precision_issues` | Smart Diagnostics | Precision issue detection |
+| 21 | `diagnose_reflection_mismatch` | Smart Diagnostics | Reflection color difference diagnosis |
+| 22 | `diagnose_mobile_risks` | Smart Diagnostics | Full mobile risk pre-check |
 
 ---
 
-## 工具调用链路示例
+## Tool Call Chain Examples
 
-以下展示 Claude Code 在真实场景下如何串联这些工具。
+The following shows how Claude Code chains these tools in real scenarios.
 
-### 场景 A：倒影比原物体颜色偏暗
+### Scenario A: Reflection darker than the original object
 
 ```
-用户: "倒影效果比原物体颜色偏暗，帮我查一下原因"
+User: "The reflection is darker than the original object, help me find the cause"
 
-Claude Code 执行链路:
+Claude Code execution chain:
 1. load_capture("frame.rdc")
-2. diagnose_reflection_mismatch()                    ← 一步到位
-   → 自动识别反射 pass、配对 draw call、对比差异
-   → 返回：shader 变体差异 + blend state 差异 + 量化的亮度损失分析
+2. diagnose_reflection_mismatch()                    ← done in one step
+   → Automatically identifies the reflection pass, pairs draw calls, compares differences
+   → Returns: shader variant differences + blend state differences + quantified brightness loss analysis
 
-如果需要深入（自动诊断不够）:
-3. compare_pipeline_state(event_a=正常DC, event_b=反射DC)
-4. get_shader_source(event_id=反射DC, search="ibl")
-5. debug_shader_at_pixel(event_id=反射DC, pixel_x=..., pixel_y=...)
+If deeper investigation is needed (automatic diagnosis is not enough):
+3. compare_pipeline_state(event_a=normal DC, event_b=reflection DC)
+4. get_shader_source(event_id=reflection DC, search="ibl")
+5. debug_shader_at_pixel(event_id=reflection DC, pixel_x=..., pixel_y=...)
 ```
 
-### 场景 B：IBL 算出负数
+### Scenario B: IBL yields negative numbers
 
 ```
-用户: "IBL 光照算出了负数，帮我定位问题"
+User: "IBL lighting yields negative numbers, help me locate the problem"
 
-Claude Code 执行链路:
+Claude Code execution chain:
 1. load_capture("frame.rdc")
-2. diagnose_negative_values()                        ← 全帧扫描负值
-   → 定位到 event 892 (IBL_Apply) 首次引入负值
+2. diagnose_negative_values()                        ← full-frame negative scan
+   → Locates event 892 (IBL_Apply) as where negatives first appear
 3. get_shader_source(event_id=892, search="SampleSH")
-   → 查看 SH 采样代码有没有 clamp
+   → Checks whether the SH sampling code has a clamp
 4. get_shader_constants(event_id=892, filter="sh")
-   → 检查 SH 系数值是否合理
+   → Checks whether the SH coefficient values are reasonable
 5. debug_shader_at_pixel(event_id=892, pixel_x=412, pixel_y=789, watch=["iblDiffuse"])
-   → 追踪负值产生的具体步骤
+   → Traces the specific step that produces the negative
 6. get_texture_info(resource_id=IBL_cubemap_id, all_slices=true)
-   → 检查 cubemap 本身是否包含负值
+   → Checks whether the cubemap itself contains negatives
 ```
 
-### 场景 C：手机端爆闪（TAA 负值）
+### Scenario C: Mobile bright flashes (TAA negatives)
 
 ```
-用户: "手机上偶尔出现画面爆闪，怀疑是 TAA 的问题"
+User: "Bright flashes occasionally appear on the phone; I suspect TAA"
 
-Claude Code 执行链路:
+Claude Code execution chain:
 1. load_capture("frame_flash.rdc")
-2. get_capture_info()                                ← 确认 GPU 型号和已知问题
+2. get_capture_info()                                ← confirm GPU model and known issues
 3. diagnose_negative_values(check_targets=["SceneColor","TAAHistory"])
-   → 发现 TAA history 中负值在累积放大
+   → Finds negatives accumulating and amplifying in the TAA history
 4. sample_pixel_region(event_id=TAA_event, anomaly_threshold=10.0)
-   → 定位爆闪像素的具体位置
-5. pixel_history(pixel_x=爆闪点X, pixel_y=爆闪点Y)
-   → 追踪该像素被哪些 pass 修改
+   → Locates the exact positions of the bright-flash pixels
+5. pixel_history(pixel_x=bright-flash point X, pixel_y=bright-flash point Y)
+   → Traces which passes modified this pixel
 6. debug_shader_at_pixel(event_id=TAA_event, pixel_x=..., pixel_y=..., watch=["historyColor","clampedColor","outputColor"])
-   → 追踪 TAA shader 中 history 采样和 color clipping 的过程
+   → Traces the history sampling and color clipping in the TAA shader
 7. diagnose_precision_issues(focus="color_precision")
-   → 检查 R11G11B10 格式限制是否加剧了问题
+   → Checks whether the R11G11B10 format limitation worsens the problem
 ```
 
-### 场景 D：全面性能分析与优化建议
+### Scenario D: Full performance analysis and optimization advice
 
 ```
-用户: "帧率不达标，帮我分析一下性能瓶颈并给优化建议"
+User: "The frame rate misses the target; analyze the performance bottlenecks and suggest optimizations"
 
-Claude Code 执行链路:
+Claude Code execution chain:
 1. load_capture("frame.rdc")
-2. get_capture_info()                                ← 确认设备环境
-3. get_pass_timing(granularity="pass", top_n=10)     ← 找最耗时的 pass
-4. analyze_overdraw()                                ← 检查 fill rate 压力
-5. analyze_bandwidth(breakdown_by="pass")            ← 检查带宽瓶颈
-6. analyze_state_changes()                           ← 检查合批机会
+2. get_capture_info()                                ← confirm device environment
+3. get_pass_timing(granularity="pass", top_n=10)     ← find the most expensive passes
+4. analyze_overdraw()                                ← check fill rate pressure
+5. analyze_bandwidth(breakdown_by="pass")            ← check bandwidth bottlenecks
+6. analyze_state_changes()                           ← check batching opportunities
 7. diagnose_mobile_risks(check_categories=["performance"])
-   → 综合以上数据给出优化建议优先级列表
+   → Combines the data above into a prioritized list of optimization suggestions
 ```
 
-### 场景 E：移动端 Bug 风险预检
+### Scenario E: Mobile bug risk pre-check
 
 ```
-用户: "这帧在 PC 上没问题，帮我预判一下手机上可能出什么 Bug"
+User: "This frame is fine on PC; predict what bugs might show up on phones"
 
-Claude Code 执行链路:
+Claude Code execution chain:
 1. load_capture("frame.rdc")
-2. get_capture_info()                                ← 确认 GPU 和已知问题
-3. diagnose_mobile_risks()                           ← 全面风险预检
-   → 一次性返回精度 / 性能 / 兼容性 / GPU 特定的所有风险
-4. 根据风险项中 severity=high 的内容做深入排查
+2. get_capture_info()                                ← confirm GPU and known issues
+3. diagnose_mobile_risks()                           ← full risk pre-check
+   → Returns all precision / performance / compatibility / GPU-specific risks in one call
+4. Investigate further based on the items with severity=high
 ```
 
 ---
 
-## 实现优先级建议
+## Implementation Priority Recommendations
 
-### P0 — 核心功能（先实现，能跑通基本工作流）
+### P0: Core Features (implement first; get the basic workflow running)
 
-| 工具 | 理由 |
+| Tool | Rationale |
 |------|------|
-| `load_capture` | 一切的起点 |
-| `get_capture_info` | 设备信息对移动端诊断必不可少 |
-| `list_events` | 需要能浏览帧结构 |
-| `get_event_detail` | 需要能看具体 draw call |
-| `get_pipeline_state` | 大量 Bug 跟 state 配置有关 |
-| `get_shader_source` | 需要能看 shader 代码 |
-| `get_shader_constants` | 需要能看 uniform 值 |
-| `pixel_history` | 像素级诊断的基石 |
-| `get_texture_info` | 资源检查的基础 |
+| `load_capture` | The starting point for everything |
+| `get_capture_info` | Device info is essential for mobile diagnosis |
+| `list_events` | Need to be able to browse the frame structure |
+| `get_event_detail` | Need to be able to inspect specific draw calls |
+| `get_pipeline_state` | Many bugs relate to state configuration |
+| `get_shader_source` | Need to be able to view shader code |
+| `get_shader_constants` | Need to be able to view uniform values |
+| `pixel_history` | Cornerstone of pixel-level diagnosis |
+| `get_texture_info` | Basis of resource inspection |
 
-### P1 — 高价值功能（显著提升诊断效率）
+### P1: High-Value Features (significantly improve diagnosis efficiency)
 
-| 工具 | 理由 |
+| Tool | Rationale |
 |------|------|
-| `debug_shader_at_pixel` | 精度 Bug 和计算 Bug 的终极武器，但实现复杂度高 |
-| `compare_pipeline_state` | 对比类问题（倒影偏暗等）的效率工具 |
-| `sample_pixel_region` | 爆闪定位的首选 |
-| `read_texture_pixels` | 精确检查纹理内容 |
-| `diagnose_negative_values` | 封装最常见的 Bug 类型 |
-| `get_pass_timing` | 性能分析的入口 |
+| `debug_shader_at_pixel` | The most powerful tool for precision and calculation bugs, but high implementation complexity |
+| `compare_pipeline_state` | Efficiency tool for comparison problems (dark reflection, etc.) |
+| `sample_pixel_region` | First choice for locating bright flashes |
+| `read_texture_pixels` | Precise inspection of texture content |
+| `diagnose_negative_values` | Wraps the most common bug type |
+| `get_pass_timing` | Entry point for performance analysis |
 
-### P2 — 增强功能（锦上添花）
+### P2: Enhancements (nice to have)
 
-| 工具 | 理由 |
+| Tool | Rationale |
 |------|------|
-| `read_buffer_data` | 低频使用但偶尔需要 |
-| `analyze_overdraw` | 性能优化的辅助数据 |
-| `analyze_bandwidth` | 移动端深度性能分析 |
-| `analyze_state_changes` | 合批优化的辅助 |
-| `diagnose_precision_issues` | 系统性精度排查 |
-| `diagnose_reflection_mismatch` | 反射问题的一键诊断 |
-| `diagnose_mobile_risks` | 全面预检 |
+| `read_buffer_data` | Rarely used but occasionally needed |
+| `analyze_overdraw` | Supporting data for performance optimization |
+| `analyze_bandwidth` | In-depth mobile performance analysis |
+| `analyze_state_changes` | Aid for batching optimization |
+| `diagnose_precision_issues` | Systematic precision investigation |
+| `diagnose_reflection_mismatch` | One-click diagnosis of reflection problems |
+| `diagnose_mobile_risks` | Full pre-check |
 
 ---
 
-## 实现技术要点
+## Implementation Technical Notes
 
-### RenderDoc Python API 映射
+### RenderDoc Python API Mapping
 
 ```
-MCP 工具                      → RenderDoc Python API
+MCP tool                      → RenderDoc Python API
 ──────────────────────────────────────────────────────
 load_capture                  → rd.OpenCaptureFile() + ReplayController
 get_capture_info              → controller.GetAPIProperties() + GetDriverInfo()
-list_events                   → controller.GetDrawcalls() (递归遍历树)
+list_events                   → controller.GetDrawcalls() (recursively traverse the tree)
 get_event_detail              → controller.SetFrameEvent() + GetD3D11/VulkanPipelineState()
-get_pipeline_state            → controller.GetVulkanPipelineState() (或对应 API)
+get_pipeline_state            → controller.GetVulkanPipelineState() (or the corresponding API)
 get_shader_source             → controller.GetShader() + DisassembleShader()
 get_shader_constants          → controller.GetCBuffers() + GetBufferData()
 debug_shader_at_pixel         → controller.DebugPixel()
 pixel_history                 → controller.PixelHistory()
-sample_pixel_region           → controller.GetTextureData() + numpy 分析
-get_texture_info              → controller.GetTextures() + GetTextureData() 统计
-read_texture_pixels           → controller.GetTextureData() 切片
+sample_pixel_region           → controller.GetTextureData() + numpy analysis
+get_texture_info              → controller.GetTextures() + GetTextureData() statistics
+read_texture_pixels           → controller.GetTextureData() slicing
 read_buffer_data              → controller.GetBufferData()
-get_pass_timing               → controller.FetchCounters() (如支持 GPU timing)
+get_pass_timing               → controller.FetchCounters() (if GPU timing is supported)
 ```
 
-### 注意事项
+### Notes
 
-1. **RenderDoc Python module 需要编译安装**：renderdoc 的 Python binding 不是 pip 包，需要从源码编译或从 RenderDoc 安装目录导入 `renderdoc.pyd` / `renderdoc.so`
-2. **ReplayController 是有状态的**：`SetFrameEvent(eid)` 会改变当前活跃的事件，后续的 state 查询都基于这个事件。MCP Server 需要管理好这个状态
-3. **GPU Timing 在移动端可能不可用**：部分移动端 GPU 的 RenderDoc 捕获不支持 timing counter，`get_pass_timing` 需要做好降级处理
-4. **大纹理读取的内存管理**：`GetTextureData()` 返回原始字节，大纹理可能占用大量内存，注意及时释放
-5. **Shader 调试的平台限制**：`DebugPixel()` 在某些 API / GPU 组合下可能不支持，需要检查 `controller.GetDebugMessages()`
+1. **The RenderDoc Python module must be built and installed**: the renderdoc Python binding is not a pip package.
+   Build it from source, or import `renderdoc.pyd` / `renderdoc.so` from the RenderDoc install directory.
+2. **ReplayController is stateful**: `SetFrameEvent(eid)` changes the currently active event.
+   All later state queries are based on that event.
+   The MCP Server must manage this state.
+3. **GPU timing may be unavailable on mobile**: RenderDoc captures from some mobile GPUs do not support timing counters.
+   `get_pass_timing` needs graceful degradation.
+4. **Memory management for large texture reads**: `GetTextureData()` returns raw bytes.
+   Large textures can use a lot of memory, so release them promptly.
+5. **Shader debugging platform limits**: `DebugPixel()` may be unsupported on some API / GPU combinations.
+   Check `controller.GetDebugMessages()`.
