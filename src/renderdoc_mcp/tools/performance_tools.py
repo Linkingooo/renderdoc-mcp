@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from renderdoc_mcp.session import get_session
 from renderdoc_mcp.util import (
@@ -19,7 +19,7 @@ from renderdoc_mcp.util import (
 )
 
 
-def register(mcp: FastMCP):
+def register(mcp: MCPServer):
 
     @mcp.tool()
     def get_pass_timing(

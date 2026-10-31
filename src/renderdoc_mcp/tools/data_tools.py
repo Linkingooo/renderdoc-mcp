@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from renderdoc_mcp.session import get_session
 from renderdoc_mcp.util import (
@@ -23,7 +23,7 @@ from renderdoc_mcp.util import (
 MAX_BUFFER_READ = 65536  # 64 KB limit
 
 
-def register(mcp: FastMCP):
+def register(mcp: MCPServer):
     @mcp.tool()
     def save_texture(
         resource_id: str,

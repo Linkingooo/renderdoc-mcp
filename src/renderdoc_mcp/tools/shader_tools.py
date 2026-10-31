@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from renderdoc_mcp.session import get_session
 from renderdoc_mcp.util import (
@@ -34,7 +34,7 @@ def _reflection_fallback(stage: str, refl) -> dict:
     return result
 
 
-def register(mcp: FastMCP):
+def register(mcp: MCPServer):
     @mcp.tool()
     def disassemble_shader(
         stage: str,

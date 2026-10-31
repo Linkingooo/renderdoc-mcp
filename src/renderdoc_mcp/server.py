@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import atexit
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from renderdoc_mcp.session import get_session
 from renderdoc_mcp.tools import (
@@ -19,7 +19,7 @@ from renderdoc_mcp.tools import (
     diagnostic_tools,
 )
 
-mcp = FastMCP(
+mcp = MCPServer(
     "renderdoc-mcp",
     instructions="RenderDoc graphics debugger MCP server — analyze GPU frame captures (.rdc) with AI",
 )
@@ -121,7 +121,17 @@ atexit.register(_cleanup)
 # ── Entry point ──
 
 def main():
-    mcp.run()
+    import os
+
+    transport = os.environ.get("RENDERDOC_MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.run(
+            transport="streamable-http",
+            host=os.environ.get("RENDERDOC_MCP_HOST", "127.0.0.1"),
+            port=int(os.environ.get("RENDERDOC_MCP_PORT", "8100")),
+        )
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
