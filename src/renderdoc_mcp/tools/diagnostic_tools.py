@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from renderdoc_mcp.session import get_session
 from renderdoc_mcp.util import (
@@ -78,7 +78,7 @@ def _sample_rt_for_negatives(session, tex_id, tex_desc, n_samples: int = 128):
     }
 
 
-def register(mcp: FastMCP):
+def register(mcp: MCPServer):
 
     @mcp.tool()
     def diagnose_negative_values(

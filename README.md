@@ -45,14 +45,18 @@ cd renderdoc-mcp
 pip install -e .
 ```
 
-### 3. Find your `renderdoc.pyd` path
+### 3. Find your Python module path
 
-The Python module is in your RenderDoc install directory:
+For Windows, the Python module is in your RenderDoc install directory `C:\Program Files\RenderDoc\renderdoc.pyd`
 
-| Platform | Typical path |
-|----------|-------------|
-| Windows  | `C:\Program Files\RenderDoc\renderdoc.pyd` |
-| Linux    | `/usr/lib/renderdoc/librenderdoc.so` or where you built it |
+For Linux, you will need to build the Python module:
+```
+git clone --depth 1 --branch v1.46 https://github.com/baldurk/renderdoc.git renderdoc
+cmake -B renderdoc/build -S renderdoc -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_PYRENDERDOC=ON -DENABLE_QRENDERDOC=OFF -DENABLE_RENDERDOCCMD=OFF -DFORCE_PY_VERSION=3.10
+cmake --build renderdoc/build
+mkdir lib
+cp renderdoc/build/lib/*.so lib
+```
 
 You need the **directory** containing this file.
 
@@ -105,8 +109,11 @@ Add to `.claude/settings.json`:
 
 ```bash
 # Set the module path
-export RENDERDOC_MODULE_PATH="/path/to/renderdoc"   # Linux/macOS
+export RENDERDOC_MODULE_PATH="/path/to/renderdoc"     # Linux/macOS
 set RENDERDOC_MODULE_PATH=C:\Program Files\RenderDoc  # Windows
+export RENDERDOC_MCP_TRANSPORT=streamable-http        # If you want to use HTTP instead of stdio
+export RENDERDOC_MCP_HOST=127.0.0.1                   # optional, defaults to 127.0.0.1
+export RENDERDOC_MCP_PORT=8100                        # optional, defaults to 8100
 
 # Run
 python -m renderdoc_mcp

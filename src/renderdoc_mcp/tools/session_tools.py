@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from renderdoc_mcp.session import get_session
 from renderdoc_mcp.util import rd, to_json, make_error, flags_to_list
@@ -45,7 +45,7 @@ def _get_gpu_quirks(driver_name: str) -> list[str]:
     return quirks
 
 
-def register(mcp: FastMCP):
+def register(mcp: MCPServer):
     @mcp.tool()
     def open_capture(filepath: str) -> str:
         """Open a RenderDoc capture (.rdc) file for analysis.

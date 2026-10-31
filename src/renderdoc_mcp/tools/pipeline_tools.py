@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from renderdoc_mcp.session import get_session
 from renderdoc_mcp.util import (
@@ -172,7 +172,7 @@ def _serialize_pipeline_state(state) -> dict:
     return result
 
 
-def register(mcp: FastMCP):
+def register(mcp: MCPServer):
     @mcp.tool()
     def get_pipeline_state(event_id: Optional[int] = None) -> str:
         """Get the full graphics pipeline state at the current or specified event.

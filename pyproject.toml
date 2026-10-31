@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "MCP server for RenderDoc graphics debugger - enables AI-assisted frame capture analysis"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=2.0.0",
 ]
 
 [project.scripts]
